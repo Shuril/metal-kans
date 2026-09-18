@@ -122,12 +122,12 @@ Batch Size   | Latency (ms)    | Throughput (samples/sec) | Intermediate VRAM
 
 ### Multi-Architecture Benchmark (Batch 4,096, 64 -> 64)
 
-| Architecture | MLX JIT | metal-KANs (v0.2.1) | Speedup vs MLX | Optimization Highlights |
+| Architecture | MLX JIT | metal-KANs (v0.2.2) | Speedup vs MLX | Optimization Highlights |
 | :--- | :--- | :--- | :--- | :--- |
-| **ChebyKAN** | 3.12 ms | **1.49 ms** | **2.09x** | Clenshaw recurrence in GPU registers |
-| **BSplineKAN** | 2.26 ms | **1.44 ms** | **1.56x** | **11.4x speedup** via closed-form cubic Horner kernel |
-| **FastKAN** | 0.85 ms | **2.06 ms** | 0.41x | Shared-memory Gaussian RBF basis caching |
-| **WavKAN** | 0.92 ms | **2.14 ms** | 0.43x | `float4` SIMD vectorization & hardware `exp2` math |
+| **ChebyKAN** | 1.45 ms | **1.23 ms** | **1.18x** | Clenshaw recurrence in GPU registers |
+| **BSplineKAN** | 2.07 ms | **1.52 ms** | **1.37x** | Closed-form cubic Horner polynomial in registers |
+| **FastKAN** | 1.28 ms | **1.16 ms** | **1.10x** | Decoupled SIMD float4 RBF + hardware MPS GEMM (was 2.06 ms) |
+| **WavKAN** | 1.12 ms | **0.92 ms** | **1.22x** | Vectorized SIMD wavelets + hardware MPS GEMM (was 2.14 ms) |
 | **3-Layer Deep MetalKAN** | 6.15 ms | **4.88 ms** | **1.26x** | Single GPU command buffer pipeline |
 
 ---

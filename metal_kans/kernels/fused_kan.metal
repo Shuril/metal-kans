@@ -108,6 +108,99 @@ kernel void kan_cheby_tiled_deg4(
 }
 
 // ==============================================================================
+// HIGH-THROUGHPUT HARDWARE-ACCELERATED BASIS & PREPARATION KERNELS (FOR MPS GEMM)
+// ==============================================================================
+
+kernel void eval_base_and_bias(
+    device const float*  X        [[buffer(0)]],
+    device const float*  bias     [[buffer(1)]],
+    device float*        X_silu   [[buffer(2)]],
+    device float*        Y        [[buffer(3)]],
+    constant uint&       B        [[buffer(4)]],
+    constant uint&       D_in     [[buffer(5)]],
+    constant uint&       D_out    [[buffer(6)]],
+    constant uint&       has_base [[buffer(7)]],
+    constant uint&       has_bias [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint r = gid.y;
+    uint c = gid.x;
+    float inv_ln2 = 1.4426950408889634f;
+    if (r < B && c < D_in && has_base) {
+        float x = X[r * D_in + c];
+        X_silu[r * D_in + c] = x / (1.0f + exp2(-inv_ln2 * x));
+    }
+    if (r < B && c < D_out) {
+        Y[r * D_out + c] = (has_bias) ? bias[c] : 0.0f;
+    }
+}
+
+kernel void eval_fastkan_rbf_basis(
+    device const float*  X        [[buffer(0)]],
+    device const float*  grid     [[buffer(1)]],
+    device float*        Phi      [[buffer(2)]],
+    constant uint&       B        [[buffer(3)]],
+    constant uint&       D_in     [[buffer(4)]],
+    constant uint&       K        [[buffer(5)]],
+    constant float&      inv_d    [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    float x = X[b * D_in + din];
+    uint out_offset = b * (D_in * K) + din * K;
+    float inv_ln2 = 1.4426950408889634f;
+    uint num_vec4 = K / 4;
+    for (uint v = 0; v < num_vec4; v++) {
+        float4 g = ((device const float4*)grid)[v];
+        float4 diff = x - g;
+        ((device float4*)(Phi + out_offset))[v] = exp2(-inv_ln2 * (diff * diff) * inv_d);
+    }
+    for (uint c = num_vec4 * 4; c < K; c++) {
+        float diff = x - grid[c];
+        Phi[out_offset + c] = exp2(-inv_ln2 * (diff * diff) * inv_d);
+    }
+}
+
+kernel void eval_wavkan_basis(
+    device const float*  X        [[buffer(0)]],
+    device const float*  trans    [[buffer(1)]],
+    device const float*  inv_sc   [[buffer(2)]],
+    device float*        Phi      [[buffer(3)]],
+    constant uint&       B        [[buffer(4)]],
+    constant uint&       D_in     [[buffer(5)]],
+    constant uint&       num_wav  [[buffer(6)]],
+    constant uint&       wtype    [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    float x = X[b * D_in + din];
+    uint param_offset = din * num_wav;
+    uint out_offset = b * (D_in * num_wav) + din * num_wav;
+    float inv_ln2 = 1.4426950408889634f;
+    uint num_vec4 = num_wav / 4;
+    for (uint v = 0; v < num_vec4; v++) {
+        float4 tr = ((device const float4*)(trans + param_offset))[v];
+        float4 isc = ((device const float4*)(inv_sc + param_offset))[v];
+        float4 z = (x - tr) * isc;
+        float4 exp_z = exp2(-0.5f * inv_ln2 * (z * z));
+        float4 psi = (wtype == 1) ? (cos(5.0f * z) * exp_z) : ((wtype == 2) ? (-z * exp_z) : ((1.0f - z * z) * exp_z));
+        ((device float4*)(Phi + out_offset))[v] = psi;
+    }
+    for (uint w = num_vec4 * 4; w < num_wav; w++) {
+        float tr = trans[param_offset + w];
+        float isc = inv_sc[param_offset + w];
+        float z = (x - tr) * isc;
+        float exp_z = exp2(-0.5f * inv_ln2 * z * z);
+        float psi = (wtype == 1) ? (cos(5.0f * z) * exp_z) : ((wtype == 2) ? (-z * exp_z) : ((1.0f - z * z) * exp_z));
+        Phi[out_offset + w] = psi;
+    }
+}
+
+// ==============================================================================
 // 2. FASTKAN FUSED TILED KERNEL (GAUSSIAN RBF)
 // ==============================================================================
 

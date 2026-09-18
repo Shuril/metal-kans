@@ -46,7 +46,7 @@ def get_metal_bridge() -> ctypes.CDLL:
         # Compile dynamic library using clang++ with Metal and Foundation frameworks
         cmd = [
             "clang++", "-O3", "-dynamiclib",
-            "-framework", "Metal", "-framework", "Foundation",
+            "-framework", "Metal", "-framework", "Foundation", "-framework", "MetalPerformanceShaders",
             _MM_PATH, "-o", _DYLIB_PATH
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
@@ -121,6 +121,13 @@ def get_metal_bridge() -> ctypes.CDLL:
         ctypes.c_int, ctypes.c_int
     ]
     lib.benchmark_metal_cheby.restype = ctypes.c_double
+
+    lib.benchmark_metal_fastkan.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int
+    ]
+    lib.benchmark_metal_fastkan.restype = ctypes.c_double
 
     lib.benchmark_metal_wavkan.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,

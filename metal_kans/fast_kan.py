@@ -83,3 +83,29 @@ class FastKAN:
         return y
 
     __call__ = forward
+
+    def benchmark(self, x: np.ndarray, warmup: int = 10, iters: int = 50) -> float:
+        """Benchmarks kernel execution time in milliseconds directly on GPU."""
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x, dtype=np.float32)
+        elif x.dtype != np.float32:
+            x = x.astype(np.float32)
+
+        x_flat = x.reshape(-1, self.in_features)
+        if not x_flat.flags['C_CONTIGUOUS']:
+            x_flat = np.ascontiguousarray(x_flat)
+
+        B, D_in = x_flat.shape
+        y = np.empty((B, self.out_features), dtype=np.float32)
+
+        return self._bridge.benchmark_metal_fastkan(
+            x_flat.ctypes.data,
+            self.w_rbf.ctypes.data,
+            self.w_base.ctypes.data,
+            self.grid.ctypes.data,
+            self.bias.ctypes.data,
+            y.ctypes.data,
+            B, D_in, self.out_features, self.num_centers, self.inv_denominator,
+            self.has_base, self.has_bias,
+            warmup, iters
+        )
