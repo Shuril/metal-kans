@@ -1,0 +1,85 @@
+"""
+Direct Metal Fused FastKAN Layer (Gaussian Radial Basis Functions - RBF).
+Evaluates Gaussian kernels and linear projection in GPU registers without basis memory buffers.
+"""
+
+from __future__ import annotations
+import math
+import numpy as np
+from typing import Tuple, Optional
+from .device import get_metal_bridge
+
+
+class FastKAN:
+    """
+    Direct Metal Fused FastKAN Layer.
+
+    Parameters:
+        in_features: Number of input features.
+        out_features: Number of output features.
+        num_centers: Number of Gaussian RBF centers (default 8).
+        grid_range: Tuple of (min, max) range for RBF center placement (default (-1.0, 1.0)).
+        bias: Whether to add trainable additive bias (default True).
+        use_base: Whether to include residual SiLU base connection (default True).
+    """
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        num_centers: int = 8,
+        grid_range: Tuple[float, float] = (-1.0, 1.0),
+        bias: bool = True,
+        use_base: bool = True,
+    ):
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_centers = num_centers
+        self.has_base = 1 if use_base else 0
+        self.has_bias = 1 if bias else 0
+
+        self.grid = np.linspace(grid_range[0], grid_range[1], num_centers, dtype=np.float32)
+        h = (grid_range[1] - grid_range[0]) / (num_centers - 1)
+        self.inv_denominator = float(1.0 / (2.0 * (h ** 2)))
+
+        bound = 1.0 / math.sqrt(in_features)
+        self.w_rbf = np.random.uniform(-bound, bound, (out_features, in_features * num_centers)).astype(np.float32)
+        self.w_base = np.random.uniform(-bound, bound, (out_features, in_features)).astype(np.float32) if use_base else np.zeros((1,), dtype=np.float32)
+        self.bias = np.zeros((out_features,), dtype=np.float32) if bias else np.zeros((1,), dtype=np.float32)
+
+        self._bridge = get_metal_bridge()
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        """Executes fused Metal forward pass."""
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x, dtype=np.float32)
+        elif x.dtype != np.float32:
+            x = x.astype(np.float32)
+
+        orig_shape = x.shape
+        if x.ndim > 2:
+            x = x.reshape(-1, self.in_features)
+        if not x.flags['C_CONTIGUOUS']:
+            x = np.ascontiguousarray(x)
+
+        B, D_in = x.shape
+        if D_in != self.in_features:
+            raise ValueError(f"Expected in_features={self.in_features}, got {D_in}")
+
+        y = np.empty((B, self.out_features), dtype=np.float32)
+
+        self._bridge.metal_kan_fastkan_forward(
+            x.ctypes.data,
+            self.w_rbf.ctypes.data,
+            self.w_base.ctypes.data,
+            self.grid.ctypes.data,
+            self.bias.ctypes.data,
+            y.ctypes.data,
+            B, D_in, self.out_features, self.num_centers, self.inv_denominator,
+            self.has_base, self.has_bias
+        )
+
+        if len(orig_shape) > 2:
+            return y.reshape(*orig_shape[:-1], self.out_features)
+        return y
+
+    __call__ = forward
