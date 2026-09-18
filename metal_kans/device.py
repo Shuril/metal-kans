@@ -77,6 +77,44 @@ def get_metal_bridge() -> ctypes.CDLL:
     ]
     lib.metal_kan_relu_forward.restype = ctypes.c_int
 
+    lib.metal_kan_wavkan_forward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_wavkan_forward.restype = ctypes.c_int
+
+    lib.metal_kan_fourier_forward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_fourier_forward.restype = ctypes.c_int
+
+    lib.metal_kan_jacobi_forward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_jacobi_forward.restype = ctypes.c_int
+
+    lib.metal_kan_rational_forward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_rational_forward.restype = ctypes.c_int
+
+    lib.metal_kan_bspline_forward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_bspline_forward.restype = ctypes.c_int
+
+    lib.metal_kan_chain_pipeline_cheby.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)
+    ]
+    lib.metal_kan_chain_pipeline_cheby.restype = ctypes.c_int
+
     lib.benchmark_metal_cheby.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,

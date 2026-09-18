@@ -5,35 +5,51 @@
 [![Metal Shading Language](https://img.shields.io/badge/MSL-3.0+-orange.svg)](https://developer.apple.com/metal/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**metal-KANs** is a pure **Metal Shading Language (MSL)** implementation of **Kolmogorov-Arnold Networks (KAN)** for Apple Silicon (M1 / M2 / M3 / M4 / Pro / Max / Ultra) with a clean, lightweight Python / NumPy wrapper.
+**metal-KANs** is a pure **Metal Shading Language (MSL)** Kolmogorov-Arnold Networks (KAN) suite for Apple Silicon (M1 / M2 / M3 / M4 / Pro / Max / Ultra) with a lightweight, idiomatic Python / NumPy wrapper.
 
-Unlike traditional deep learning implementations that materialize intermediate basis tensors in VRAM before running matrix multiplication, **metal-KANs fuses basis evaluation and projection GEMM directly into GPU hardware registers and threadgroup shared memory (SRAM)**.
+Unlike standard deep learning frameworks that materialize intermediate 3D basis tensors in VRAM before launching a matrix multiplication GEMM, **metal-KANs fuses basis evaluation and projection accumulation directly inside GPU thread registers and threadgroup shared memory (SRAM)**.
 
-> 🇷🇺 *Русскоязычная версия доступна в [README_RU.md](README_RU.md).*
+> 🇷🇺 *Русскоязычная версия документации доступна в [README_RU.md](README_RU.md).*
 
 ---
 
 ## Key Highlights
 
-- **Zero-Allocation GPU Pipeline**: Basis functions (Chebyshev recurrence, Gaussian RBF, piecewise linear tent) are evaluated directly in thread registers and fused with the output GEMM accumulator in a single GPU pass. Zero intermediate VRAM buffers are allocated.
-- **Zero-Copy Host Interop**: Directly binds host NumPy arrays to Metal compute pipelines using macOS Unified Memory pointers (`newBufferWithBytesNoCopy`). No `memcpy` between CPU and GPU.
-- **Hardware Architecture Optimizations**:
-  - **Threadgroup SRAM Tiling**: $32 \times 32$ collaborative shared memory tiles for input vectors and weight matrices.
-  - **2D Register Blocking**: $2 \times 2$ registers per GPU thread, maximizing instruction-level parallelism.
-  - **`simdgroup_matrix` Acceleration**: Native support for Apple Silicon 8x8 matrix coprocessor execution.
-- **Zero Heavyweight Dependencies**: No PyTorch, MLX, or libtorch required. Requires only `numpy` and macOS Command Line Tools (`clang++`).
-- **Throughput**: Up to **11.6+ Million samples/sec** on a base Apple M1 GPU.
+- **Complete Suite of 10 KAN Architectures**:
+  - `ChebyKAN`: Chebyshev polynomial recurrence ($T_k(x) = 2x T_{k-1} - T_{k-2}$) in registers.
+  - `FastKAN`: Gaussian Radial Basis Functions (RBF) with shared centers.
+  - `ReLUKAN`: Piecewise linear tent basis with zero transcendental operations.
+  - `WavKAN`: Continuous wavelets (Mexican Hat, Morlet, DOG) for multiresolution localization.
+  - `FourierKAN`: Trigonometric harmonic series ($\cos(k \pi x), \sin(k \pi x)$) for periodic signals.
+  - `JacobiKAN`: Orthogonal Jacobi polynomials with weighting parameters $(\alpha, \beta)$.
+  - `RationalKAN`: Padé-Chebyshev rational functions ($P(x) / (1 + |Q(x)|)$) for poles and boundary layers.
+  - `BSplineKAN` / `KAN`: Classic Cox-de Boor cubic B-spline evaluation in registers.
+  - `MultKAN`: KAN 2.0 with explicit multiplication nodes ($u \cdot v$) for physical conservation laws.
+  - `LowRankKAN`: Bottleneck / LoRA factorized spline projections with up to 10x parameter reduction.
+- **Zero-Allocation GPU Compute**: Basis functions are computed on the fly in thread registers and fused with the output GEMM accumulator: **0 intermediate VRAM allocations**.
+- **Zero-Copy Host Interoperability**: Direct pointer binding to host NumPy arrays via macOS Unified Memory (`newBufferWithBytesNoCopy`). No `memcpy` between CPU and GPU.
+- **Single-Dispatch Chained Pipeline**: Multi-layer networks execute in a single command buffer with ping-pong GPU buffers, eliminating CPU synchronization latency.
+- **Native Quantization**: Block-affine INT8 and packed INT4 weight quantization (`to_int8`, `to_int4`).
+- **Structural Pruning & Compaction**: Node importance scoring and physical neuron compaction (`compact_kan`).
+- **Symbolic Regression & C Export**: Converts trained KAN activations into mathematical formulas and exports standalone C99 headers (`export_c`).
+- **Zero Framework Bloat**: Pure Metal backend. No PyTorch, MLX, or libtorch required.
 
 ---
 
 ## Supported Architectures
 
-| Layer | Mathematical Basis | GPU Kernel Characteristics | Best For |
+| Architecture | Mathematical Basis | Hardware Acceleration | Recommended Use Case |
 |---|---|---|---|
-| **`ChebyKAN`** | Chebyshev polynomials ($T_k(x) = 2x T_{k-1} - T_{k-2}$) | Evaluated via recurrence in registers | Smooth functions, physical modeling |
-| **`FastKAN`** | Gaussian RBF ($\exp(-\frac{(x - \mu)^2}{2\sigma^2})$) | Fast vector math with shared centers | General function approximation |
-| **`ReLUKAN`** | Piecewise linear tent ($\max(0, 1 - \frac{\|x - \mu\|}{h})$) | Zero transcendental ops, hardware clamp | Low latency, edge inference |
-| **`MetalKAN`** | Sequential multi-layer container | Pipelined execution across multiple layers | Deep KAN architectures |
+| **`ChebyKAN`** | Chebyshev polynomials ($T_k$) | 3-term recurrence in registers | Smooth functions, physical modeling |
+| **`FastKAN`** | Gaussian RBF ($\exp(-d^2 / 2\sigma^2)$) | Shared centers in threadgroup SRAM | Universal function approximation |
+| **`ReLUKAN`** | Piecewise linear tent | Hardware clamp, 0 transcendental ops | Low latency, edge inference |
+| **`WavKAN`** | Mexican Hat, Morlet, DOG | Localized wavelets in registers | Time series, frequency analysis |
+| **`FourierKAN`** | Harmonics ($\cos, \sin$) | Trigonometric SIMD evaluation | Periodic signals, PINNs, audio |
+| **`JacobiKAN`** | Jacobi polynomials $(\alpha, \beta)$ | Generalized orthogonal recurrence | Differential equations, boundary problems |
+| **`RationalKAN`** | Padé rational ($P/Q$) | Chebyshev rational fractions | Poles, boundary layers, kinetics |
+| **`BSplineKAN`** | Cox-de Boor B-splines | Knot interval search & recursion | Classic KAN, interpretability |
+| **`MultKAN`** | Multiplicative nodes ($u \cdot v$) | Fused spline + product channels | Analytical formulas, physics |
+| **`LowRankKAN`** | Rank factorized ($W_{\text{up}} W_{\text{down}}$) | Bottleneck projection | Deep / wide high-dimensional models |
 
 ---
 
@@ -48,7 +64,7 @@ cd metal-kans
 pip install -e .
 ```
 
-*Note: On first import, the C++/Objective-C Metal bridge compiles automatically using the system's `clang++` in under 1 second.*
+*Note: On first import, the C++/Objective-C Metal bridge is automatically compiled by the system `clang++` in under 1 second.*
 
 ---
 
@@ -56,28 +72,32 @@ pip install -e .
 
 ```python
 import numpy as np
-from metal_kans import ChebyKAN, FastKAN, ReLUKAN, MetalKAN
-
-# 1. Single ChebyKAN layer (in_features=64, out_features=32, degree=4)
-layer = ChebyKAN(in_features=64, out_features=32, degree=4)
-
-x = np.random.uniform(-1.0, 1.0, (1024, 64)).astype(np.float32)
-y = layer(x)
-print("Output shape:", y.shape)  # (1024, 32)
-
-# 2. Multi-layer Pure Metal KAN
-model = MetalKAN(
-    layers_hidden=[64, 128, 64, 10], 
-    basis_type="cheby", 
-    degree=4
+from metal_kans import (
+    ChebyKAN, FastKAN, ReLUKAN, WavKAN, FourierKAN, JacobiKAN, RationalKAN, BSplineKAN,
+    MetalKAN, to_int8, compact_kan, to_symbolic
 )
-out = model(x)
-print("Model output shape:", out.shape)  # (1024, 10)
 
-# 3. Built-in latency benchmark
-latency_ms = layer.benchmark(x, warmup=10, iters=50)
-throughput = len(x) / (latency_ms / 1000.0)
-print(f"Latency: {latency_ms:.3f} ms | Throughput: {throughput:,.0f} samples/sec")
+# 1. Instantiate a multi-layer KAN network with GPU pipelining
+model = MetalKAN(
+    layers_hidden=[4, 32, 16, 2], 
+    basis_type="cheby", 
+    degree=4, 
+    pipeline=True
+)
+
+x = np.random.uniform(-1.0, 1.0, (1024, 4)).astype(np.float32)
+y = model(x)
+print("Output shape:", y.shape)  # (1024, 2)
+
+# 2. INT8 Quantization (4x parameter compression)
+to_int8(model)
+
+# 3. Structural Pruning & Physical Compaction
+compact_model = compact_kan(model, threshold=1e-3)
+
+# 4. Symbolic Formula Discovery & C Code Export
+sym = to_symbolic(compact_model, sample_points=100)
+sym.export_c("kan_model.h", func_name="kan_predict")
 ```
 
 ---
@@ -98,35 +118,25 @@ Batch Size   | Latency (ms)    | Throughput (samples/sec) | Intermediate VRAM
 65,536       | 9.165 ms        |        7,150,867         | 0 KB (Registers)
 ================================================================================
 ```
+*(Peak single-layer throughput exceeds **11.6+ Million samples/sec** on base Apple M1).*
 
 ---
 
-## Architecture & Kernel Design
+## C Code Export
 
-Traditional framework execution graphs materialize full basis tensor expansions:
-$$\text{Input: } [B, D_{\text{in}}] \xrightarrow{\text{Basis Expansion}} \text{Tensor: } [B, D_{\text{in}}, K] \xrightarrow{\text{Linear GEMM}} \text{Output: } [B, D_{\text{out}}]$$
+Export trained KAN models to zero-dependency standalone C99 headers for embedded deployment:
 
-For large batches ($B \ge 1024$), this intermediate allocation wastes megabytes of GPU bandwidth and triggers kernel launch synchronization delays.
+```c
+#include "kan_model.h"
 
-**metal-KANs eliminates the intermediate tensor:**
+int main() {
+    float x[4] = {0.2f, -0.5f, 0.8f, 0.1f};
+    float y[2];
+    kan_predict(x, y);
+    printf("Prediction: %f, %f\n", y[0], y[1]);
+    return 0;
+}
 ```
-                Threadgroup Shared Memory (SRAM)
-  Input Tile ──────────────────────────────────────┐
-  [32 x 8]                                         │
-                                                   ▼
-                ┌──────────────────────────────────────────────────┐
-                │ Thread Registers (2x2 per thread)                │
-                │ 1. Evaluate basis recurrence: T_k(x) or RBF      │
-                │ 2. Multiply-accumulate with weight tile          │
-                └──────────────────────────────────────────────────┘
-                                                   │
-  Output Tile ◄────────────────────────────────────┘
-  [32 x 32] (Directly committed to unified memory)
-```
-
-1. **Collaborative Tile Loading**: Threads within a threadgroup collaboratively read $32 \times 8$ slices of inputs and weights into threadgroup SRAM cache.
-2. **On-the-Fly Basis Computation**: Each thread evaluates the basis recurrence directly within hardware registers.
-3. **Register-Blocked Accumulation**: 4 independent accumulators (`acc00`, `acc01`, `acc10`, `acc11`) update concurrently, hiding arithmetic latency.
 
 ---
 

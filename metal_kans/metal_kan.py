@@ -1,26 +1,37 @@
 """
 Sequential Multi-Layer Pure Metal KAN Network.
+Supports all 10 KAN architectures with GPU-pipelined execution.
 """
 
 from __future__ import annotations
 import numpy as np
-from typing import Sequence, List, Union
+import ctypes
+from typing import Sequence, List, Union, Optional
 from .cheby_kan import ChebyKAN
 from .fast_kan import FastKAN
 from .relu_kan import ReLUKAN
+from .wav_kan import WavKAN
+from .fourier_kan import FourierKAN
+from .jacobi_kan import JacobiKAN
+from .rational_kan import RationalKAN
+from .bspline_kan import BSplineKAN, KAN
+from .mult_kan import MultKAN
+from .low_rank_kan import LowRankKAN
+from .device import get_metal_bridge
 
 
 class MetalKAN:
     """
     Multi-Layer Pure Metal KAN Network.
-    Executes sequentially on Apple Silicon GPU without requiring MLX or PyTorch.
+    Executes sequentially on Apple Silicon GPU without requiring PyTorch or MLX.
 
     Parameters:
         layers_hidden: List or tuple of layer widths, e.g. [4, 16, 8, 2].
-        basis_type: Type of basis ('cheby', 'fastkan', 'relu'). Default: 'cheby'.
+        basis_type: Type of basis ('cheby', 'fastkan', 'relu', 'wav', 'fourier', 'jacobi', 'rational', 'bspline', 'mult', 'lowrank'). Default: 'cheby'.
         degree: Basis order or grid points (default 4).
         bias: Whether to include bias term (default True).
         use_base: Whether to include residual base connections (default True).
+        pipeline: Whether to use single-dispatch chained GPU pipeline (for ChebyKAN).
     """
     def __init__(
         self,
@@ -29,29 +40,94 @@ class MetalKAN:
         degree: int = 4,
         bias: bool = True,
         use_base: bool = True,
+        pipeline: bool = False,
     ):
         self.layers_hidden = list(layers_hidden)
         self.basis_type = basis_type.lower()
-        self.layers: List[Union[ChebyKAN, FastKAN, ReLUKAN]] = []
+        self.degree = degree
+        self.bias = bias
+        self.use_base = use_base
+        self.pipeline = pipeline and (self.basis_type in ("cheby", "chebyshev"))
+        self.layers = []
 
         for i in range(len(layers_hidden) - 1):
             in_f = layers_hidden[i]
             out_f = layers_hidden[i + 1]
+
             if self.basis_type in ("cheby", "chebyshev"):
                 layer = ChebyKAN(in_f, out_f, degree=degree, bias=bias, use_base=use_base)
             elif self.basis_type in ("fastkan", "rbf"):
                 layer = FastKAN(in_f, out_f, num_centers=degree, bias=bias, use_base=use_base)
             elif self.basis_type in ("relukan", "relu", "tent"):
                 layer = ReLUKAN(in_f, out_f, num_grids=degree, bias=bias, use_base=use_base)
+            elif self.basis_type in ("wav", "wavkan", "wavelet"):
+                layer = WavKAN(in_f, out_f, num_wavelets=degree, bias=bias, use_base=use_base)
+            elif self.basis_type in ("fourier", "fourierkan"):
+                layer = FourierKAN(in_f, out_f, num_frequencies=degree, bias=bias, use_base=use_base)
+            elif self.basis_type in ("jacobi", "jacobikan"):
+                layer = JacobiKAN(in_f, out_f, degree=degree, bias=bias, use_base=use_base)
+            elif self.basis_type in ("rational", "rationalkan"):
+                layer = RationalKAN(in_f, out_f, p_degree=degree, q_degree=max(2, degree // 2), bias=bias, use_base=use_base)
+            elif self.basis_type in ("bspline", "spline", "kan"):
+                layer = BSplineKAN(in_f, out_f, grid_size=degree, bias=bias, use_base=use_base)
+            elif self.basis_type in ("mult", "multkan"):
+                layer = MultKAN(in_f, out_f, num_grids=degree, bias=bias, use_base=use_base)
+            elif self.basis_type in ("lowrank", "lowrankkan"):
+                layer = LowRankKAN(in_f, out_f, rank=degree, num_grids=degree, bias=bias, use_base=use_base)
             else:
-                raise ValueError(f"Unknown basis_type: {basis_type}. Expected 'cheby', 'fastkan', or 'relu'.")
+                raise ValueError(f"Unknown basis_type: {basis_type}")
+
             self.layers.append(layer)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         """Executes forward pass sequentially through all Metal layers."""
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x, dtype=np.float32)
+        elif x.dtype != np.float32:
+            x = x.astype(np.float32)
+
+        # Chained single-dispatch pipeline optimization for ChebyKAN
+        if self.pipeline and len(self.layers) > 1:
+            return self._forward_pipelined_cheby(x)
+
         for layer in self.layers:
             x = layer(x)
         return x
+
+    def _forward_pipelined_cheby(self, x: np.ndarray) -> np.ndarray:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, self.layers_hidden[0])
+        if not x_flat.flags['C_CONTIGUOUS']:
+            x_flat = np.ascontiguousarray(x_flat)
+
+        B = x_flat.shape[0]
+        out_dim = self.layers_hidden[-1]
+        y = np.empty((B, out_dim), dtype=np.float32)
+
+        num_layers = len(self.layers)
+        c_layer_dims = (ctypes.c_int * (num_layers + 1))(*self.layers_hidden)
+        c_degrees = (ctypes.c_int * num_layers)(*[l.degree for l in self.layers])
+
+        c_w_chebys = (ctypes.c_void_p * num_layers)(*[ctypes.c_void_p(l.w_cheby.ctypes.data) for l in self.layers])
+        c_w_bases = (ctypes.c_void_p * num_layers)(*[ctypes.c_void_p(l.w_base.ctypes.data) if l.has_base else None for l in self.layers])
+        c_biases = (ctypes.c_void_p * num_layers)(*[ctypes.c_void_p(l.bias.ctypes.data) if l.has_bias else None for l in self.layers])
+
+        bridge = get_metal_bridge()
+        bridge.metal_kan_chain_pipeline_cheby(
+            x_flat.ctypes.data,
+            y.ctypes.data,
+            B,
+            num_layers,
+            c_layer_dims,
+            c_degrees,
+            c_w_chebys,
+            c_w_bases,
+            c_biases
+        )
+
+        if len(orig_shape) > 2:
+            return y.reshape(*orig_shape[:-1], out_dim)
+        return y
 
     __call__ = forward
 
