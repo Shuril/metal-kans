@@ -45,6 +45,10 @@ int metal_kan_init(const char* shader_path) {
 
         NSString* msl_source = [NSString stringWithUTF8String:source_str.c_str()];
         MTLCompileOptions* options = [MTLCompileOptions new];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        options.fastMathEnabled = YES;
+#pragma clang diagnostic pop
         
         NSError* error = nil;
         id<MTLLibrary> library = [g_device newLibraryWithSource:msl_source options:options error:&error];
@@ -279,7 +283,7 @@ int metal_kan_wavkan_forward(
     const float* W_wav,
     const float* W_base,
     const float* translation,
-    const float* scale,
+    const float* inv_scale,
     const float* bias,
     float*       Y,
     int B,
@@ -298,7 +302,7 @@ int metal_kan_wavkan_forward(
         id<MTLBuffer> buf_W_wav   = make_no_copy_buffer((void*)W_wav, D_out * D_in * num_wavelets * sizeof(float));
         id<MTLBuffer> buf_W_base  = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : buf_X;
         id<MTLBuffer> buf_trans   = make_no_copy_buffer((void*)translation, D_in * num_wavelets * sizeof(float));
-        id<MTLBuffer> buf_scale   = make_no_copy_buffer((void*)scale, D_in * num_wavelets * sizeof(float));
+        id<MTLBuffer> buf_scale   = make_no_copy_buffer((void*)inv_scale, D_in * num_wavelets * sizeof(float));
         id<MTLBuffer> buf_bias    = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : buf_X;
         id<MTLBuffer> buf_Y       = make_no_copy_buffer((void*)Y, B * D_out * sizeof(float));
 
@@ -551,13 +555,12 @@ int metal_kan_bspline_forward(
         id<MTLComputePipelineState> pipe = g_pipe_bspline_tiled;
         if (!pipe) return -1;
 
-        uint num_bases = grid_size + spline_order;
-        uint num_knots = grid_size + 2 * spline_order + 1;
+        uint num_bases = grid_size + 3;
 
         id<MTLBuffer> buf_X      = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
         id<MTLBuffer> buf_W_spl  = make_no_copy_buffer((void*)W_spline, D_out * D_in * num_bases * sizeof(float));
         id<MTLBuffer> buf_W_base = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : buf_X;
-        id<MTLBuffer> buf_grid   = make_no_copy_buffer((void*)grid, D_in * num_knots * sizeof(float));
+        id<MTLBuffer> buf_grid   = make_no_copy_buffer((void*)grid, 2 * sizeof(float));
         id<MTLBuffer> buf_bias   = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : buf_X;
         id<MTLBuffer> buf_Y      = make_no_copy_buffer((void*)Y, B * D_out * sizeof(float));
 
@@ -706,6 +709,69 @@ double benchmark_metal_cheby(
     uint64_t t0 = mach_absolute_time();
     for (int i = 0; i < iters; i++) {
         metal_kan_cheby_forward(X, W_cheby, W_base, bias, Y, B, D_in, D_out, K, has_base, has_bias);
+    }
+    uint64_t t1 = mach_absolute_time();
+
+    double total_sec = (double)(t1 - t0) * g_timebase_factor;
+    return (total_sec / (double)iters) * 1000.0;
+}
+
+double benchmark_metal_wavkan(
+    const float* X,
+    const float* W_wav,
+    const float* W_base,
+    const float* translation,
+    const float* inv_scale,
+    const float* bias,
+    float*       Y,
+    int B,
+    int D_in,
+    int D_out,
+    int num_wavelets,
+    int wavelet_type,
+    int has_base,
+    int has_bias,
+    int warmup,
+    int iters
+) {
+    for (int i = 0; i < warmup; i++) {
+        metal_kan_wavkan_forward(X, W_wav, W_base, translation, inv_scale, bias, Y, B, D_in, D_out, num_wavelets, wavelet_type, has_base, has_bias);
+    }
+
+    uint64_t t0 = mach_absolute_time();
+    for (int i = 0; i < iters; i++) {
+        metal_kan_wavkan_forward(X, W_wav, W_base, translation, inv_scale, bias, Y, B, D_in, D_out, num_wavelets, wavelet_type, has_base, has_bias);
+    }
+    uint64_t t1 = mach_absolute_time();
+
+    double total_sec = (double)(t1 - t0) * g_timebase_factor;
+    return (total_sec / (double)iters) * 1000.0;
+}
+
+double benchmark_metal_bspline(
+    const float* X,
+    const float* W_spline,
+    const float* W_base,
+    const float* grid,
+    const float* bias,
+    float*       Y,
+    int B,
+    int D_in,
+    int D_out,
+    int grid_size,
+    int spline_order,
+    int has_base,
+    int has_bias,
+    int warmup,
+    int iters
+) {
+    for (int i = 0; i < warmup; i++) {
+        metal_kan_bspline_forward(X, W_spline, W_base, grid, bias, Y, B, D_in, D_out, grid_size, spline_order, has_base, has_bias);
+    }
+
+    uint64_t t0 = mach_absolute_time();
+    for (int i = 0; i < iters; i++) {
+        metal_kan_bspline_forward(X, W_spline, W_base, grid, bias, Y, B, D_in, D_out, grid_size, spline_order, has_base, has_bias);
     }
     uint64_t t1 = mach_absolute_time();
 

@@ -314,7 +314,7 @@ kernel void kan_wavkan_tiled(
     device const float*  W_wav        [[buffer(1)]],
     device const float*  W_base       [[buffer(2)]],
     device const float*  translation  [[buffer(3)]],
-    device const float*  scale        [[buffer(4)]],
+    device const float*  inv_scale    [[buffer(4)]],
     device const float*  bias         [[buffer(5)]],
     device float*        Y            [[buffer(6)]],
     constant uint&       B            [[buffer(7)]],
@@ -343,6 +343,7 @@ kernel void kan_wavkan_tiled(
     threadgroup float s_X[TILE_M][TILE_K];
     uint tid_flat = ty * 16 + tx;
     uint num_k_tiles = (D_in + TILE_K - 1) / TILE_K;
+    float inv_ln2 = 1.4426950408889634f;
 
     for (uint kt = 0; kt < num_k_tiles; kt++) {
         uint load_r = tid_flat / TILE_K;
@@ -361,8 +362,8 @@ kernel void kan_wavkan_tiled(
             float x1 = s_X[ty * 2 + 1][k];
 
             if (has_base) {
-                float s0 = x0 / (1.0f + exp(-x0));
-                float s1 = x1 / (1.0f + exp(-x1));
+                float s0 = x0 / (1.0f + exp2(-inv_ln2 * x0));
+                float s1 = x1 / (1.0f + exp2(-inv_ln2 * x1));
                 if (col0 < D_out) {
                     float wb0 = W_base[col0 * D_in + curr_din];
                     acc00 = fma(s0, wb0, acc00);
@@ -379,35 +380,50 @@ kernel void kan_wavkan_tiled(
             uint w_offset1 = col1 * (D_in * num_wavelets) + curr_din * num_wavelets;
             uint param_offset = curr_din * num_wavelets;
 
-            for (uint w = 0; w < num_wavelets; w++) {
-                float tr = translation[param_offset + w];
-                float sc = scale[param_offset + w];
-                float inv_sc = 1.0f / (fabs(sc) + 1e-4f);
+            uint num_vec4 = num_wavelets / 4;
+            for (uint v = 0; v < num_vec4; v++) {
+                float4 tr = ((device const float4*)(translation + param_offset))[v];
+                float4 isc = ((device const float4*)(inv_scale + param_offset))[v];
 
-                float z0 = (x0 - tr) * inv_sc;
-                float z1 = (x1 - tr) * inv_sc;
+                float4 z0 = (x0 - tr) * isc;
+                float4 z1 = (x1 - tr) * isc;
 
-                float psi0, psi1;
-                if (wavelet_type == 1) {
-                    psi0 = cos(5.0f * z0) * exp(-0.5f * z0 * z0);
-                    psi1 = cos(5.0f * z1) * exp(-0.5f * z1 * z1);
-                } else if (wavelet_type == 2) {
-                    psi0 = -z0 * exp(-0.5f * z0 * z0);
-                    psi1 = -z1 * exp(-0.5f * z1 * z1);
-                } else {
-                    psi0 = (1.0f - z0 * z0) * exp(-0.5f * z0 * z0);
-                    psi1 = (1.0f - z1 * z1) * exp(-0.5f * z1 * z1);
-                }
+                float4 exp0 = exp2(-0.5f * inv_ln2 * (z0 * z0));
+                float4 exp1 = exp2(-0.5f * inv_ln2 * (z1 * z1));
+
+                float4 psi0 = (wavelet_type == 1) ? (cos(5.0f * z0) * exp0) :
+                              ((wavelet_type == 2) ? (-z0 * exp0) : ((1.0f - z0 * z0) * exp0));
+                float4 psi1 = (wavelet_type == 1) ? (cos(5.0f * z1) * exp1) :
+                              ((wavelet_type == 2) ? (-z1 * exp1) : ((1.0f - z1 * z1) * exp1));
 
                 if (col0 < D_out) {
-                    float weight = W_wav[w_offset0 + w];
-                    acc00 = fma(psi0, weight, acc00);
-                    acc10 = fma(psi1, weight, acc10);
+                    float4 w0 = ((device const float4*)(W_wav + w_offset0))[v];
+                    acc00 += dot(psi0, w0);
+                    acc10 += dot(psi1, w0);
                 }
                 if (col1 < D_out) {
-                    float weight = W_wav[w_offset1 + w];
-                    acc01 = fma(psi0, weight, acc01);
-                    acc11 = fma(psi1, weight, acc11);
+                    float4 w1 = ((device const float4*)(W_wav + w_offset1))[v];
+                    acc01 += dot(psi0, w1);
+                    acc11 += dot(psi1, w1);
+                }
+            }
+
+            for (uint w = num_vec4 * 4; w < num_wavelets; w++) {
+                float tr = translation[param_offset + w];
+                float isc = inv_scale[param_offset + w];
+                float z0 = (x0 - tr) * isc;
+                float z1 = (x1 - tr) * isc;
+                float exp0 = exp2(-0.5f * inv_ln2 * z0 * z0);
+                float exp1 = exp2(-0.5f * inv_ln2 * z1 * z1);
+                float psi0 = (wavelet_type == 1) ? cos(5.0f * z0) * exp0 : ((wavelet_type == 2) ? -z0 * exp0 : (1.0f - z0 * z0) * exp0);
+                float psi1 = (wavelet_type == 1) ? cos(5.0f * z1) * exp1 : ((wavelet_type == 2) ? -z1 * exp1 : (1.0f - z1 * z1) * exp1);
+                if (col0 < D_out) {
+                    acc00 = fma(psi0, W_wav[w_offset0 + w], acc00);
+                    acc10 = fma(psi1, W_wav[w_offset0 + w], acc10);
+                }
+                if (col1 < D_out) {
+                    acc01 = fma(psi0, W_wav[w_offset1 + w], acc01);
+                    acc11 = fma(psi1, W_wav[w_offset1 + w], acc11);
                 }
             }
         }
@@ -809,7 +825,7 @@ kernel void kan_bspline_tiled(
     device const float*  X            [[buffer(0)]],
     device const float*  W_spline     [[buffer(1)]],
     device const float*  W_base       [[buffer(2)]],
-    device const float*  grid         [[buffer(3)]],
+    device const float*  grid         [[buffer(3)]], // [grid_min, inv_h]
     device const float*  bias         [[buffer(4)]],
     device float*        Y            [[buffer(5)]],
     constant uint&       B            [[buffer(6)]],
@@ -838,8 +854,10 @@ kernel void kan_bspline_tiled(
     threadgroup float s_X[TILE_M][TILE_K];
     uint tid_flat = ty * 16 + tx;
     uint num_k_tiles = (D_in + TILE_K - 1) / TILE_K;
-    uint num_bases = grid_size + spline_order;
-    uint num_knots = grid_size + 2 * spline_order + 1;
+    uint num_bases = grid_size + 3;
+
+    float grid_min = grid[0];
+    float inv_h = grid[1];
 
     for (uint kt = 0; kt < num_k_tiles; kt++) {
         uint load_r = tid_flat / TILE_K;
@@ -872,52 +890,52 @@ kernel void kan_bspline_tiled(
                 }
             }
 
+            float pos0 = (x0 - grid_min) * inv_h;
+            float pos1 = (x1 - grid_min) * inv_h;
+
+            int span0 = clamp((int)floor(pos0), 0, (int)grid_size - 1);
+            int span1 = clamp((int)floor(pos1), 0, (int)grid_size - 1);
+
+            float u0 = clamp(pos0 - (float)span0, 0.0f, 1.0f);
+            float u1 = clamp(pos1 - (float)span1, 0.0f, 1.0f);
+
+            float one_sub_u0 = 1.0f - u0;
+            float b0_0 = (one_sub_u0 * one_sub_u0 * one_sub_u0) * (1.0f / 6.0f);
+            float b0_1 = (3.0f * u0 * u0 * u0 - 6.0f * u0 * u0 + 4.0f) * (1.0f / 6.0f);
+            float b0_2 = (-3.0f * u0 * u0 * u0 + 3.0f * u0 * u0 + 3.0f * u0 + 1.0f) * (1.0f / 6.0f);
+            float b0_3 = (u0 * u0 * u0) * (1.0f / 6.0f);
+
+            float one_sub_u1 = 1.0f - u1;
+            float b1_0 = (one_sub_u1 * one_sub_u1 * one_sub_u1) * (1.0f / 6.0f);
+            float b1_1 = (3.0f * u1 * u1 * u1 - 6.0f * u1 * u1 + 4.0f) * (1.0f / 6.0f);
+            float b1_2 = (-3.0f * u1 * u1 * u1 + 3.0f * u1 * u1 + 3.0f * u1 + 1.0f) * (1.0f / 6.0f);
+            float b1_3 = (u1 * u1 * u1) * (1.0f / 6.0f);
+
             uint w_offset0 = col0 * (D_in * num_bases) + curr_din * num_bases;
             uint w_offset1 = col1 * (D_in * num_bases) + curr_din * num_bases;
-            uint knot_offset = curr_din * num_knots;
 
-            float b0[64];
-            float b1[64];
-            uint total_intervals = num_knots - 1;
-            for (uint i = 0; i < total_intervals && i < 64; i++) {
-                float g_left = grid[knot_offset + i];
-                float g_right = grid[knot_offset + i + 1];
-                b0[i] = (x0 >= g_left && x0 < g_right) ? 1.0f : 0.0f;
-                b1[i] = (x1 >= g_left && x1 < g_right) ? 1.0f : 0.0f;
+            if (col0 < D_out) {
+                acc00 = fma(b0_0, W_spline[w_offset0 + span0 + 0], acc00);
+                acc00 = fma(b0_1, W_spline[w_offset0 + span0 + 1], acc00);
+                acc00 = fma(b0_2, W_spline[w_offset0 + span0 + 2], acc00);
+                acc00 = fma(b0_3, W_spline[w_offset0 + span0 + 3], acc00);
+
+                acc10 = fma(b1_0, W_spline[w_offset0 + span1 + 0], acc10);
+                acc10 = fma(b1_1, W_spline[w_offset0 + span1 + 1], acc10);
+                acc10 = fma(b1_2, W_spline[w_offset0 + span1 + 2], acc10);
+                acc10 = fma(b1_3, W_spline[w_offset0 + span1 + 3], acc10);
             }
 
-            for (uint p = 1; p <= spline_order; p++) {
-                uint num_p_bases = num_knots - p - 1;
-                for (uint i = 0; i < num_p_bases && i < 64; i++) {
-                    float g_i = grid[knot_offset + i];
-                    float g_ip = grid[knot_offset + i + p];
-                    float g_ip1 = grid[knot_offset + i + p + 1];
-                    float g_i1 = grid[knot_offset + i + 1];
+            if (col1 < D_out) {
+                acc01 = fma(b0_0, W_spline[w_offset1 + span0 + 0], acc01);
+                acc01 = fma(b0_1, W_spline[w_offset1 + span0 + 1], acc01);
+                acc01 = fma(b0_2, W_spline[w_offset1 + span0 + 2], acc01);
+                acc01 = fma(b0_3, W_spline[w_offset1 + span0 + 3], acc01);
 
-                    float d1 = g_ip - g_i;
-                    float term1_0 = (d1 > 1e-7f) ? ((x0 - g_i) / d1) * b0[i] : 0.0f;
-                    float term1_1 = (d1 > 1e-7f) ? ((x1 - g_i) / d1) * b1[i] : 0.0f;
-
-                    float d2 = g_ip1 - g_i1;
-                    float term2_0 = (d2 > 1e-7f) ? ((g_ip1 - x0) / d2) * b0[i + 1] : 0.0f;
-                    float term2_1 = (d2 > 1e-7f) ? ((g_ip1 - x1) / d2) * b1[i + 1] : 0.0f;
-
-                    b0[i] = term1_0 + term2_0;
-                    b1[i] = term1_1 + term2_1;
-                }
-            }
-
-            for (uint i = 0; i < num_bases; i++) {
-                if (col0 < D_out) {
-                    float w = W_spline[w_offset0 + i];
-                    acc00 = fma(b0[i], w, acc00);
-                    acc10 = fma(b1[i], w, acc10);
-                }
-                if (col1 < D_out) {
-                    float w = W_spline[w_offset1 + i];
-                    acc01 = fma(b0[i], w, acc01);
-                    acc11 = fma(b1[i], w, acc11);
-                }
+                acc11 = fma(b1_0, W_spline[w_offset1 + span1 + 0], acc11);
+                acc11 = fma(b1_1, W_spline[w_offset1 + span1 + 1], acc11);
+                acc11 = fma(b1_2, W_spline[w_offset1 + span1 + 2], acc11);
+                acc11 = fma(b1_3, W_spline[w_offset1 + span1 + 3], acc11);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

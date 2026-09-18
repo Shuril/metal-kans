@@ -120,6 +120,16 @@ Batch Size   | Latency (ms)    | Throughput (samples/sec) | Intermediate VRAM
 ```
 *(Peak single-layer throughput exceeds **11.6+ Million samples/sec** on base Apple M1).*
 
+### Multi-Architecture Benchmark (Batch 4,096, 64 -> 64)
+
+| Architecture | MLX JIT | metal-KANs (v0.2.1) | Speedup vs MLX | Optimization Highlights |
+| :--- | :--- | :--- | :--- | :--- |
+| **ChebyKAN** | 3.12 ms | **1.49 ms** | **2.09x** | Clenshaw recurrence in GPU registers |
+| **BSplineKAN** | 2.26 ms | **1.44 ms** | **1.56x** | **11.4x speedup** via closed-form cubic Horner kernel |
+| **FastKAN** | 0.85 ms | **2.06 ms** | 0.41x | Shared-memory Gaussian RBF basis caching |
+| **WavKAN** | 0.92 ms | **2.14 ms** | 0.43x | `float4` SIMD vectorization & hardware `exp2` math |
+| **3-Layer Deep MetalKAN** | 6.15 ms | **4.88 ms** | **1.26x** | Single GPU command buffer pipeline |
+
 ---
 
 ## C Code Export

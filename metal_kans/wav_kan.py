@@ -46,7 +46,8 @@ class WavKAN:
 
         # Translation & scale parameters
         self.translation = np.random.uniform(-1.0, 1.0, (in_features, num_wavelets)).astype(np.float32)
-        self.scale = np.random.uniform(0.5, 2.0, (in_features, num_wavelets)).astype(np.float32)
+        self._scale = np.random.uniform(0.5, 2.0, (in_features, num_wavelets)).astype(np.float32)
+        self._inv_scale = (1.0 / (np.abs(self._scale) + 1e-4)).astype(np.float32)
 
         bound = 1.0 / math.sqrt(in_features)
         self.w_wav = np.random.uniform(-bound, bound, (out_features, in_features * num_wavelets)).astype(np.float32)
@@ -54,6 +55,15 @@ class WavKAN:
         self.bias = np.zeros((out_features,), dtype=np.float32) if bias else np.zeros((1,), dtype=np.float32)
 
         self._bridge = get_metal_bridge()
+
+    @property
+    def scale(self) -> np.ndarray:
+        return self._scale
+
+    @scale.setter
+    def scale(self, val: np.ndarray):
+        self._scale = np.asarray(val, dtype=np.float32)
+        self._inv_scale = (1.0 / (np.abs(self._scale) + 1e-4)).astype(np.float32)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
         """Executes fused Metal forward pass."""
@@ -79,7 +89,7 @@ class WavKAN:
             self.w_wav.ctypes.data,
             self.w_base.ctypes.data,
             self.translation.ctypes.data,
-            self.scale.ctypes.data,
+            self._inv_scale.ctypes.data,
             self.bias.ctypes.data,
             y.ctypes.data,
             B, D_in, self.out_features, self.num_wavelets, self.wavelet_type,
@@ -91,3 +101,30 @@ class WavKAN:
         return y
 
     __call__ = forward
+
+    def benchmark(self, x: np.ndarray, warmup: int = 10, iters: int = 50) -> float:
+        """Benchmarks kernel execution time in milliseconds directly on GPU."""
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x, dtype=np.float32)
+        elif x.dtype != np.float32:
+            x = x.astype(np.float32)
+
+        x_flat = x.reshape(-1, self.in_features)
+        if not x_flat.flags['C_CONTIGUOUS']:
+            x_flat = np.ascontiguousarray(x_flat)
+
+        B, D_in = x_flat.shape
+        y = np.empty((B, self.out_features), dtype=np.float32)
+
+        return self._bridge.benchmark_metal_wavkan(
+            x_flat.ctypes.data,
+            self.w_wav.ctypes.data,
+            self.w_base.ctypes.data,
+            self.translation.ctypes.data,
+            self._inv_scale.ctypes.data,
+            self.bias.ctypes.data,
+            y.ctypes.data,
+            B, D_in, self.out_features, self.num_wavelets, self.wavelet_type,
+            self.has_base, self.has_bias,
+            warmup, iters
+        )

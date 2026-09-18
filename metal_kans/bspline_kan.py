@@ -37,17 +37,16 @@ class BSplineKAN:
         self.out_features = out_features
         self.grid_size = grid_size
         self.spline_order = spline_order
-        self.num_bases = grid_size + spline_order
-        self.num_knots = grid_size + 2 * spline_order + 1
+        self.num_bases = grid_size + 3
         self.has_base = 1 if use_base else 0
         self.has_bias = 1 if bias else 0
 
-        # Uniform knot vector extended by spline_order on both sides
-        h = (grid_range[1] - grid_range[0]) / grid_size
-        grid_start = grid_range[0] - spline_order * h
-        grid_end = grid_range[1] + spline_order * h
-        knots_1d = np.linspace(grid_start, grid_end, self.num_knots, dtype=np.float32)
-        self.grid = np.tile(knots_1d, (in_features, 1)).astype(np.float32)
+        # Closed-form cubic B-splines parameterization: [grid_min, inv_h]
+        self.grid_min = float(grid_range[0])
+        self.grid_max = float(grid_range[1])
+        self.inv_h = float(grid_size) / (self.grid_max - self.grid_min)
+        self.grid_params = np.array([self.grid_min, self.inv_h], dtype=np.float32)
+        self.grid = self.grid_params
 
         bound = 1.0 / math.sqrt(in_features)
         self.w_spline = np.random.uniform(-bound, bound, (out_features, in_features * self.num_bases)).astype(np.float32)
@@ -91,6 +90,32 @@ class BSplineKAN:
         return y
 
     __call__ = forward
+
+    def benchmark(self, x: np.ndarray, warmup: int = 10, iters: int = 50) -> float:
+        """Benchmarks kernel execution time in milliseconds directly on GPU."""
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x, dtype=np.float32)
+        elif x.dtype != np.float32:
+            x = x.astype(np.float32)
+
+        x_flat = x.reshape(-1, self.in_features)
+        if not x_flat.flags['C_CONTIGUOUS']:
+            x_flat = np.ascontiguousarray(x_flat)
+
+        B, D_in = x_flat.shape
+        y = np.empty((B, self.out_features), dtype=np.float32)
+
+        return self._bridge.benchmark_metal_bspline(
+            x_flat.ctypes.data,
+            self.w_spline.ctypes.data,
+            self.w_base.ctypes.data,
+            self.grid.ctypes.data,
+            self.bias.ctypes.data,
+            y.ctypes.data,
+            B, D_in, self.out_features, self.grid_size, self.spline_order,
+            self.has_base, self.has_bias,
+            warmup, iters
+        )
 
 
 # Alias KAN to BSplineKAN
