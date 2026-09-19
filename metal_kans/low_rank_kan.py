@@ -89,3 +89,14 @@ class LowRankKAN:
         return y
 
     __call__ = forward
+
+    def benchmark(self, x: np.ndarray, warmup: int = 10, iters: int = 50) -> float:
+        """Benchmarks forward execution in milliseconds."""
+        for _ in range(warmup):
+            self.forward(x)
+        import time
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            self.forward(x)
+        t1 = time.perf_counter()
+        return ((t1 - t0) / iters) * 1000.0

@@ -54,9 +54,10 @@ class MultKAN:
             bias=bias,
             use_base=use_base,
         )
+        self._bridge = self.sub_layer._bridge
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """Executes fused Metal sub-layer and multiplicative channel combination."""
+        """Executes fused Metal sub-layer and multiplicative channel combination on GPU."""
         internal = self.sub_layer(x)
 
         if self.num_mult == 0:
@@ -64,19 +65,33 @@ class MultKAN:
 
         orig_shape = internal.shape
         flat = internal.reshape(-1, self.internal_out)
+        if not flat.flags['C_CONTIGUOUS']:
+            flat = np.ascontiguousarray(flat)
+        B = flat.shape[0]
 
-        y_add = flat[:, :self.num_add]
-        u = flat[:, self.num_add : self.num_add + self.num_mult]
-        v = flat[:, self.num_add + self.num_mult :]
-        y_mult = u * v
-
-        if self.num_add > 0:
-            out = np.concatenate([y_add, y_mult], axis=-1)
-        else:
-            out = y_mult
+        out = np.empty((B, self.out_features), dtype=np.float32)
+        self._bridge.metal_kan_combine_mult_nodes(
+            flat.ctypes.data,
+            out.ctypes.data,
+            B,
+            self.num_add,
+            self.num_mult
+        )
 
         if len(orig_shape) > 2:
             return out.reshape(*orig_shape[:-1], self.out_features)
         return out
 
     __call__ = forward
+
+    def benchmark(self, x: np.ndarray, warmup: int = 10, iters: int = 50) -> float:
+        """Benchmarks forward execution in milliseconds."""
+        for _ in range(warmup):
+            self.forward(x)
+        import time
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            self.forward(x)
+        t1 = time.perf_counter()
+        return ((t1 - t0) / iters) * 1000.0
+

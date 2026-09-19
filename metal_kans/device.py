@@ -143,6 +143,39 @@ def get_metal_bridge() -> ctypes.CDLL:
     ]
     lib.benchmark_metal_bspline.restype = ctypes.c_double
 
+    lib.metal_kan_combine_mult_nodes.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_combine_mult_nodes.restype = ctypes.c_int
+
+    lib.benchmark_metal_relu.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int
+    ]
+    lib.benchmark_metal_relu.restype = ctypes.c_double
+
+    lib.benchmark_metal_fourier.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int
+    ]
+    lib.benchmark_metal_fourier.restype = ctypes.c_double
+
+    lib.benchmark_metal_jacobi.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int
+    ]
+    lib.benchmark_metal_jacobi.restype = ctypes.c_double
+
+    lib.benchmark_metal_rational.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int
+    ]
+    lib.benchmark_metal_rational.restype = ctypes.c_double
+
     init_code = lib.metal_kan_init(_SHADER_PATH.encode("utf-8"))
     if init_code != 0:
         raise RuntimeError(f"Metal KAN shader initialization failed with code {init_code}")

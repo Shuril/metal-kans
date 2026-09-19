@@ -200,6 +200,189 @@ kernel void eval_wavkan_basis(
     }
 }
 
+kernel void eval_cheby_basis(
+    device const float*  X     [[buffer(0)]],
+    device float*        Phi   [[buffer(1)]],
+    constant uint&       B     [[buffer(2)]],
+    constant uint&       D_in  [[buffer(3)]],
+    constant uint&       deg   [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    float x = clamp(X[b * D_in + din], -1.0f, 1.0f);
+    uint out_offset = b * (D_in * deg) + din * deg;
+
+    if (deg == 4) {
+        float x2 = x * x;
+        float t0 = 1.0f;
+        float t1 = x;
+        float t2 = 2.0f * x2 - 1.0f;
+        float t3 = 4.0f * x2 * x - 3.0f * x;
+        ((device float4*)(Phi + out_offset))[0] = float4(t0, t1, t2, t3);
+    } else {
+        float t_prev2 = 1.0f;
+        float t_prev1 = x;
+        Phi[out_offset + 0] = t_prev2;
+        if (deg > 1) Phi[out_offset + 1] = t_prev1;
+        for (uint d = 2; d < deg; d++) {
+            float t_curr = 2.0f * x * t_prev1 - t_prev2;
+            Phi[out_offset + d] = t_curr;
+            t_prev2 = t_prev1;
+            t_prev1 = t_curr;
+        }
+    }
+}
+
+kernel void eval_bspline_basis(
+    device const float*  X            [[buffer(0)]],
+    device float*        Phi          [[buffer(1)]],
+    constant uint&       B            [[buffer(2)]],
+    constant uint&       D_in         [[buffer(3)]],
+    constant uint&       grid_size    [[buffer(4)]],
+    constant float&      grid_min     [[buffer(5)]],
+    constant float&      inv_h        [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    float x = X[b * D_in + din];
+    uint num_bases = grid_size + 3;
+    uint out_offset = b * (D_in * num_bases) + din * num_bases;
+
+    for (uint i = 0; i < num_bases; i++) {
+        Phi[out_offset + i] = 0.0f;
+    }
+
+    float pos = (x - grid_min) * inv_h;
+    int span = clamp((int)floor(pos), 0, (int)grid_size - 1);
+    float u = clamp(pos - (float)span, 0.0f, 1.0f);
+    float one_sub_u = 1.0f - u;
+
+    float b0 = (one_sub_u * one_sub_u * one_sub_u) * (1.0f / 6.0f);
+    float b1 = (3.0f * u * u * u - 6.0f * u * u + 4.0f) * (1.0f / 6.0f);
+    float b2 = (-3.0f * u * u * u + 3.0f * u * u + 3.0f * u + 1.0f) * (1.0f / 6.0f);
+    float b3 = (u * u * u) * (1.0f / 6.0f);
+
+    Phi[out_offset + span + 0] = b0;
+    Phi[out_offset + span + 1] = b1;
+    Phi[out_offset + span + 2] = b2;
+    Phi[out_offset + span + 3] = b3;
+}
+
+kernel void eval_relu_basis(
+    device const float*  X     [[buffer(0)]],
+    device const float*  grid  [[buffer(1)]],
+    device float*        Phi   [[buffer(2)]],
+    constant uint&       B     [[buffer(3)]],
+    constant uint&       D_in  [[buffer(4)]],
+    constant uint&       G     [[buffer(5)]],
+    constant float&      inv_h [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    float x = X[b * D_in + din];
+    uint out_offset = b * (D_in * G) + din * G;
+    uint num_vec4 = G / 4;
+    for (uint v = 0; v < num_vec4; v++) {
+        float4 g = ((device const float4*)grid)[v];
+        float4 diff = fabs(x - g);
+        float4 t = max(0.0f, 1.0f - diff * inv_h);
+        ((device float4*)(Phi + out_offset))[v] = t;
+    }
+    for (uint g = num_vec4 * 4; g < G; g++) {
+        float diff = fabs(x - grid[g]);
+        Phi[out_offset + g] = max(0.0f, 1.0f - diff * inv_h);
+    }
+}
+
+kernel void eval_fourier_basis(
+    device const float*  X          [[buffer(0)]],
+    device float*        Phi        [[buffer(1)]],
+    constant uint&       B          [[buffer(2)]],
+    constant uint&       D_in       [[buffer(3)]],
+    constant uint&       num_freqs  [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    float x = X[b * D_in + din];
+    uint num_bases = 2 * num_freqs + 1;
+    uint out_offset = b * (D_in * num_bases) + din * num_bases;
+
+    Phi[out_offset + 0] = 1.0f;
+    for (uint f = 0; f < num_freqs; f++) {
+        float freq = (float)(f + 1) * M_PI_F;
+        Phi[out_offset + 1 + f * 2] = cos(freq * x);
+        Phi[out_offset + 2 + f * 2] = sin(freq * x);
+    }
+}
+
+kernel void eval_jacobi_basis(
+    device const float*  X         [[buffer(0)]],
+    device float*        Phi       [[buffer(1)]],
+    constant uint&       B         [[buffer(2)]],
+    constant uint&       D_in      [[buffer(3)]],
+    constant uint&       degree    [[buffer(4)]],
+    constant float&      alpha     [[buffer(5)]],
+    constant float&      beta      [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    float x = clamp(X[b * D_in + din], -1.0f, 1.0f);
+    uint out_offset = b * (D_in * degree) + din * degree;
+    float a_b = alpha + beta;
+
+    float p_prev2 = 1.0f;
+    Phi[out_offset + 0] = p_prev2;
+    if (degree > 1) {
+        float p_prev1 = 0.5f * (alpha - beta + (a_b + 2.0f) * x);
+        Phi[out_offset + 1] = p_prev1;
+        for (uint n = 2; n < degree; n++) {
+            float fn = (float)n;
+            float an = 2.0f * fn * (fn + a_b) * (2.0f * fn + a_b - 2.0f);
+            float bn1 = (2.0f * fn + a_b - 1.0f) * (2.0f * fn + a_b) * (2.0f * fn + a_b - 2.0f);
+            float bn2 = (2.0f * fn + a_b - 1.0f) * (alpha * alpha - beta * beta);
+            float cn = 2.0f * (fn + alpha - 1.0f) * (fn + beta - 1.0f) * (2.0f * fn + a_b);
+
+            float p_curr = ((bn1 * x + bn2) * p_prev1 - cn * p_prev2) / an;
+            Phi[out_offset + n] = p_curr;
+            p_prev2 = p_prev1;
+            p_prev1 = p_curr;
+        }
+    }
+}
+
+kernel void combine_mult_nodes(
+    device const float* In        [[buffer(0)]],
+    device float*       Out       [[buffer(1)]],
+    constant uint&      B         [[buffer(2)]],
+    constant uint&      num_add   [[buffer(3)]],
+    constant uint&      num_mult  [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint j = gid.x;
+    if (b >= B || j >= (num_add + num_mult)) return;
+    uint total_in = num_add + 2 * num_mult;
+    uint total_out = num_add + num_mult;
+    if (j < num_add) {
+        Out[b * total_out + j] = In[b * total_in + j];
+    } else {
+        uint m = j - num_add;
+        float u = In[b * total_in + num_add + m];
+        float v = In[b * total_in + num_add + num_mult + m];
+        Out[b * total_out + j] = u * v;
+    }
+}
+
 // ==============================================================================
 // 2. FASTKAN FUSED TILED KERNEL (GAUSSIAN RBF)
 // ==============================================================================

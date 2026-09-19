@@ -22,6 +22,12 @@ static id<MTLComputePipelineState> g_pipe_bspline_tiled = nil;
 static id<MTLComputePipelineState> g_pipe_prep = nil;
 static id<MTLComputePipelineState> g_pipe_rbf_basis = nil;
 static id<MTLComputePipelineState> g_pipe_wav_basis = nil;
+static id<MTLComputePipelineState> g_pipe_cheby_basis = nil;
+static id<MTLComputePipelineState> g_pipe_bspline_basis = nil;
+static id<MTLComputePipelineState> g_pipe_relu_basis = nil;
+static id<MTLComputePipelineState> g_pipe_fourier_basis = nil;
+static id<MTLComputePipelineState> g_pipe_jacobi_basis = nil;
+static id<MTLComputePipelineState> g_pipe_combine_mult = nil;
 
 static double g_timebase_factor = 0.0;
 
@@ -136,11 +142,19 @@ int metal_kan_init(const char* shader_path) {
         g_pipe_prep           = make_pipe(@"eval_base_and_bias");
         g_pipe_rbf_basis      = make_pipe(@"eval_fastkan_rbf_basis");
         g_pipe_wav_basis      = make_pipe(@"eval_wavkan_basis");
+        g_pipe_cheby_basis    = make_pipe(@"eval_cheby_basis");
+        g_pipe_bspline_basis  = make_pipe(@"eval_bspline_basis");
+        g_pipe_relu_basis     = make_pipe(@"eval_relu_basis");
+        g_pipe_fourier_basis  = make_pipe(@"eval_fourier_basis");
+        g_pipe_jacobi_basis   = make_pipe(@"eval_jacobi_basis");
+        g_pipe_combine_mult   = make_pipe(@"combine_mult_nodes");
 
         if (!g_pipe_cheby_tiled || !g_pipe_fastkan_tiled || !g_pipe_relu_tiled ||
             !g_pipe_wavkan_tiled || !g_pipe_fourier_tiled || !g_pipe_jacobi_tiled ||
             !g_pipe_rational_tiled || !g_pipe_bspline_tiled ||
-            !g_pipe_prep || !g_pipe_rbf_basis || !g_pipe_wav_basis) {
+            !g_pipe_prep || !g_pipe_rbf_basis || !g_pipe_wav_basis ||
+            !g_pipe_cheby_basis || !g_pipe_bspline_basis || !g_pipe_relu_basis ||
+            !g_pipe_fourier_basis || !g_pipe_jacobi_basis || !g_pipe_combine_mult) {
             std::cerr << "[MetalKAN] Failed to create one or more compute pipelines!" << std::endl;
             return -4;
         }
@@ -170,42 +184,70 @@ int metal_kan_cheby_forward(
     int has_bias
 ) {
     @autoreleasepool {
-        id<MTLComputePipelineState> pipe = g_pipe_cheby_tiled;
-        if (!pipe) return -1;
-
+        int K_dim = D_in * K;
         id<MTLBuffer> buf_X       = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
-        id<MTLBuffer> buf_W_cheby = make_no_copy_buffer((void*)W_cheby, D_out * D_in * 4 * sizeof(float));
-        id<MTLBuffer> buf_W_base  = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : buf_X;
-        id<MTLBuffer> buf_bias    = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : buf_X;
+        id<MTLBuffer> buf_W_cheby = make_no_copy_buffer((void*)W_cheby, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base  = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_bias    = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : nil;
         id<MTLBuffer> buf_Y       = make_no_copy_buffer((void*)Y, B * D_out * sizeof(float));
 
+        id<MTLBuffer> buf_Phi    = get_scratch_phi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
+
         id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pipe];
 
-        [enc setBuffer:buf_X offset:0 atIndex:0];
-        [enc setBuffer:buf_W_cheby offset:0 atIndex:1];
-        [enc setBuffer:buf_W_base offset:0 atIndex:2];
-        [enc setBuffer:buf_bias offset:0 atIndex:3];
-        [enc setBuffer:buf_Y offset:0 atIndex:4];
+        // 1. Base SiLU and bias initialization
+        id<MTLComputeCommandEncoder> enc_prep = [cmd computeCommandEncoder];
+        [enc_prep setComputePipelineState:g_pipe_prep];
+        [enc_prep setBuffer:buf_X offset:0 atIndex:0];
+        [enc_prep setBuffer:(buf_bias ? buf_bias : buf_X) offset:0 atIndex:1];
+        [enc_prep setBuffer:(buf_X_silu ? buf_X_silu : buf_X) offset:0 atIndex:2];
+        [enc_prep setBuffer:buf_Y offset:0 atIndex:3];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+        [enc_prep setBytes:&uB length:sizeof(uint) atIndex:4];
+        [enc_prep setBytes:&uDin length:sizeof(uint) atIndex:5];
+        [enc_prep setBytes:&uDout length:sizeof(uint) atIndex:6];
+        [enc_prep setBytes:&uBase length:sizeof(uint) atIndex:7];
+        [enc_prep setBytes:&uBias length:sizeof(uint) atIndex:8];
+        uint max_dim = (D_in > D_out) ? D_in : D_out;
+        [enc_prep dispatchThreads:MTLSizeMake(max_dim, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_prep endEncoding];
 
-        uint uB = (uint)B;
-        uint uD_in = (uint)D_in;
-        uint uD_out = (uint)D_out;
-        uint u_has_base = (uint)has_base;
-        uint u_has_bias = (uint)has_bias;
+        // 2. Base linear branch: Y += X_silu @ W_base.T
+        if (has_base) {
+            MPSMatrixDescriptor* desc_A_base = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_B_base = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_C_base = get_cached_desc(B, D_out, D_out * sizeof(float));
+            MPSMatrix* mat_A_base = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_A_base] autorelease];
+            MPSMatrix* mat_B_base = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_B_base] autorelease];
+            MPSMatrix* mat_C_base = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_base] autorelease];
+            MPSMatrixMultiplication* matmul_base = get_cached_matmul(g_device, B, D_out, D_in, 1.0f, 1.0f);
+            [matmul_base encodeToCommandBuffer:cmd leftMatrix:mat_A_base rightMatrix:mat_B_base resultMatrix:mat_C_base];
+        }
 
-        [enc setBytes:&uB length:sizeof(uint) atIndex:5];
-        [enc setBytes:&uD_in length:sizeof(uint) atIndex:6];
-        [enc setBytes:&uD_out length:sizeof(uint) atIndex:7];
-        [enc setBytes:&u_has_base length:sizeof(uint) atIndex:8];
-        [enc setBytes:&u_has_bias length:sizeof(uint) atIndex:9];
+        // 3. Cheby basis evaluation
+        id<MTLComputeCommandEncoder> enc_cheby = [cmd computeCommandEncoder];
+        [enc_cheby setComputePipelineState:g_pipe_cheby_basis];
+        [enc_cheby setBuffer:buf_X offset:0 atIndex:0];
+        [enc_cheby setBuffer:buf_Phi offset:0 atIndex:1];
+        uint uK = (uint)K;
+        [enc_cheby setBytes:&uB length:sizeof(uint) atIndex:2];
+        [enc_cheby setBytes:&uDin length:sizeof(uint) atIndex:3];
+        [enc_cheby setBytes:&uK length:sizeof(uint) atIndex:4];
+        [enc_cheby dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_cheby endEncoding];
 
-        MTLSize grid = MTLSizeMake((D_out + 31) / 32, (B + 31) / 32, 1);
-        MTLSize tg   = MTLSizeMake(16, 16, 1);
-        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        // 4. Matrix multiplication: Y += Phi @ W_cheby.T
+        MPSMatrixDescriptor* desc_A_cheby = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_B_cheby = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_C_cheby = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrix* mat_A_cheby = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_A_cheby] autorelease];
+        MPSMatrix* mat_B_cheby = [[[MPSMatrix alloc] initWithBuffer:buf_W_cheby descriptor:desc_B_cheby] autorelease];
+        MPSMatrix* mat_C_cheby = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_cheby] autorelease];
+        MPSMatrixMultiplication* matmul_cheby = get_cached_matmul(g_device, B, D_out, K_dim, 1.0f, 1.0f);
+        [matmul_cheby encodeToCommandBuffer:cmd leftMatrix:mat_A_cheby rightMatrix:mat_B_cheby resultMatrix:mat_C_cheby];
 
-        [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
 
@@ -320,48 +362,74 @@ int metal_kan_relu_forward(
     int has_bias
 ) {
     @autoreleasepool {
-        id<MTLComputePipelineState> pipe = g_pipe_relu_tiled;
-        if (!pipe) return -1;
-
+        int K_dim = D_in * num_grids;
         id<MTLBuffer> buf_X      = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
-        id<MTLBuffer> buf_W_relu = make_no_copy_buffer((void*)W_relu, D_out * D_in * num_grids * sizeof(float));
-        id<MTLBuffer> buf_W_base = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : buf_X;
+        id<MTLBuffer> buf_W_relu = make_no_copy_buffer((void*)W_relu, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
         id<MTLBuffer> buf_grid   = make_no_copy_buffer((void*)grid, num_grids * sizeof(float));
-        id<MTLBuffer> buf_bias   = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : buf_X;
+        id<MTLBuffer> buf_bias   = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : nil;
         id<MTLBuffer> buf_Y      = make_no_copy_buffer((void*)Y, B * D_out * sizeof(float));
 
+        id<MTLBuffer> buf_Phi    = get_scratch_phi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
+
         id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pipe];
 
-        [enc setBuffer:buf_X offset:0 atIndex:0];
-        [enc setBuffer:buf_W_relu offset:0 atIndex:1];
-        [enc setBuffer:buf_W_base offset:0 atIndex:2];
-        [enc setBuffer:buf_grid offset:0 atIndex:3];
-        [enc setBuffer:buf_bias offset:0 atIndex:4];
-        [enc setBuffer:buf_Y offset:0 atIndex:5];
+        // 1. Base SiLU and bias initialization
+        id<MTLComputeCommandEncoder> enc_prep = [cmd computeCommandEncoder];
+        [enc_prep setComputePipelineState:g_pipe_prep];
+        [enc_prep setBuffer:buf_X offset:0 atIndex:0];
+        [enc_prep setBuffer:(buf_bias ? buf_bias : buf_X) offset:0 atIndex:1];
+        [enc_prep setBuffer:(buf_X_silu ? buf_X_silu : buf_X) offset:0 atIndex:2];
+        [enc_prep setBuffer:buf_Y offset:0 atIndex:3];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+        [enc_prep setBytes:&uB length:sizeof(uint) atIndex:4];
+        [enc_prep setBytes:&uDin length:sizeof(uint) atIndex:5];
+        [enc_prep setBytes:&uDout length:sizeof(uint) atIndex:6];
+        [enc_prep setBytes:&uBase length:sizeof(uint) atIndex:7];
+        [enc_prep setBytes:&uBias length:sizeof(uint) atIndex:8];
+        uint max_dim = (D_in > D_out) ? D_in : D_out;
+        [enc_prep dispatchThreads:MTLSizeMake(max_dim, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_prep endEncoding];
 
-        uint uB = (uint)B;
-        uint uD_in = (uint)D_in;
-        uint uD_out = (uint)D_out;
-        uint u_num_grids = (uint)num_grids;
+        // 2. Base linear branch: Y += X_silu @ W_base.T
+        if (has_base) {
+            MPSMatrixDescriptor* desc_A_base = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_B_base = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_C_base = get_cached_desc(B, D_out, D_out * sizeof(float));
+            MPSMatrix* mat_A_base = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_A_base] autorelease];
+            MPSMatrix* mat_B_base = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_B_base] autorelease];
+            MPSMatrix* mat_C_base = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_base] autorelease];
+            MPSMatrixMultiplication* matmul_base = get_cached_matmul(g_device, B, D_out, D_in, 1.0f, 1.0f);
+            [matmul_base encodeToCommandBuffer:cmd leftMatrix:mat_A_base rightMatrix:mat_B_base resultMatrix:mat_C_base];
+        }
+
+        // 3. ReLUKAN basis evaluation
+        id<MTLComputeCommandEncoder> enc_relu = [cmd computeCommandEncoder];
+        [enc_relu setComputePipelineState:g_pipe_relu_basis];
+        [enc_relu setBuffer:buf_X offset:0 atIndex:0];
+        [enc_relu setBuffer:buf_grid offset:0 atIndex:1];
+        [enc_relu setBuffer:buf_Phi offset:0 atIndex:2];
+        uint uG = (uint)num_grids;
         float u_inv_h = inv_h;
-        uint u_has_base = (uint)has_base;
-        uint u_has_bias = (uint)has_bias;
+        [enc_relu setBytes:&uB length:sizeof(uint) atIndex:3];
+        [enc_relu setBytes:&uDin length:sizeof(uint) atIndex:4];
+        [enc_relu setBytes:&uG length:sizeof(uint) atIndex:5];
+        [enc_relu setBytes:&u_inv_h length:sizeof(float) atIndex:6];
+        [enc_relu dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_relu endEncoding];
 
-        [enc setBytes:&uB length:sizeof(uint) atIndex:6];
-        [enc setBytes:&uD_in length:sizeof(uint) atIndex:7];
-        [enc setBytes:&uD_out length:sizeof(uint) atIndex:8];
-        [enc setBytes:&u_num_grids length:sizeof(uint) atIndex:9];
-        [enc setBytes:&u_inv_h length:sizeof(float) atIndex:10];
-        [enc setBytes:&u_has_base length:sizeof(uint) atIndex:11];
-        [enc setBytes:&u_has_bias length:sizeof(uint) atIndex:12];
+        // 4. Matrix multiplication: Y += Phi @ W_relu.T
+        MPSMatrixDescriptor* desc_A_relu = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_B_relu = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_C_relu = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrix* mat_A_relu = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_A_relu] autorelease];
+        MPSMatrix* mat_B_relu = [[[MPSMatrix alloc] initWithBuffer:buf_W_relu descriptor:desc_B_relu] autorelease];
+        MPSMatrix* mat_C_relu = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_relu] autorelease];
+        MPSMatrixMultiplication* matmul_relu = get_cached_matmul(g_device, B, D_out, K_dim, 1.0f, 1.0f);
+        [matmul_relu encodeToCommandBuffer:cmd leftMatrix:mat_A_relu rightMatrix:mat_B_relu resultMatrix:mat_C_relu];
 
-        MTLSize grid_sz = MTLSizeMake((D_out + 31) / 32, (B + 31) / 32, 1);
-        MTLSize tg   = MTLSizeMake(16, 16, 1);
-        [enc dispatchThreadgroups:grid_sz threadsPerThreadgroup:tg];
-
-        [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
 
@@ -477,45 +545,71 @@ int metal_kan_fourier_forward(
     int has_bias
 ) {
     @autoreleasepool {
-        id<MTLComputePipelineState> pipe = g_pipe_fourier_tiled;
-        if (!pipe) return -1;
-
         uint num_bases = 2 * num_freqs + 1;
-        id<MTLBuffer> buf_X       = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
-        id<MTLBuffer> buf_W_four  = make_no_copy_buffer((void*)W_fourier, D_out * D_in * num_bases * sizeof(float));
-        id<MTLBuffer> buf_W_base  = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : buf_X;
-        id<MTLBuffer> buf_bias    = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : buf_X;
-        id<MTLBuffer> buf_Y       = make_no_copy_buffer((void*)Y, B * D_out * sizeof(float));
+        int K_dim = D_in * num_bases;
+        id<MTLBuffer> buf_X      = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
+        id<MTLBuffer> buf_W_four = make_no_copy_buffer((void*)W_fourier, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_bias   = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : nil;
+        id<MTLBuffer> buf_Y      = make_no_copy_buffer((void*)Y, B * D_out * sizeof(float));
+
+        id<MTLBuffer> buf_Phi    = get_scratch_phi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
 
         id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pipe];
 
-        [enc setBuffer:buf_X offset:0 atIndex:0];
-        [enc setBuffer:buf_W_four offset:0 atIndex:1];
-        [enc setBuffer:buf_W_base offset:0 atIndex:2];
-        [enc setBuffer:buf_bias offset:0 atIndex:3];
-        [enc setBuffer:buf_Y offset:0 atIndex:4];
+        // 1. Base SiLU and bias initialization
+        id<MTLComputeCommandEncoder> enc_prep = [cmd computeCommandEncoder];
+        [enc_prep setComputePipelineState:g_pipe_prep];
+        [enc_prep setBuffer:buf_X offset:0 atIndex:0];
+        [enc_prep setBuffer:(buf_bias ? buf_bias : buf_X) offset:0 atIndex:1];
+        [enc_prep setBuffer:(buf_X_silu ? buf_X_silu : buf_X) offset:0 atIndex:2];
+        [enc_prep setBuffer:buf_Y offset:0 atIndex:3];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+        [enc_prep setBytes:&uB length:sizeof(uint) atIndex:4];
+        [enc_prep setBytes:&uDin length:sizeof(uint) atIndex:5];
+        [enc_prep setBytes:&uDout length:sizeof(uint) atIndex:6];
+        [enc_prep setBytes:&uBase length:sizeof(uint) atIndex:7];
+        [enc_prep setBytes:&uBias length:sizeof(uint) atIndex:8];
+        uint max_dim = (D_in > D_out) ? D_in : D_out;
+        [enc_prep dispatchThreads:MTLSizeMake(max_dim, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_prep endEncoding];
 
-        uint uB = (uint)B;
-        uint uD_in = (uint)D_in;
-        uint uD_out = (uint)D_out;
+        // 2. Base linear branch: Y += X_silu @ W_base.T
+        if (has_base) {
+            MPSMatrixDescriptor* desc_A_base = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_B_base = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_C_base = get_cached_desc(B, D_out, D_out * sizeof(float));
+            MPSMatrix* mat_A_base = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_A_base] autorelease];
+            MPSMatrix* mat_B_base = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_B_base] autorelease];
+            MPSMatrix* mat_C_base = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_base] autorelease];
+            MPSMatrixMultiplication* matmul_base = get_cached_matmul(g_device, B, D_out, D_in, 1.0f, 1.0f);
+            [matmul_base encodeToCommandBuffer:cmd leftMatrix:mat_A_base rightMatrix:mat_B_base resultMatrix:mat_C_base];
+        }
+
+        // 3. Fourier basis evaluation
+        id<MTLComputeCommandEncoder> enc_four = [cmd computeCommandEncoder];
+        [enc_four setComputePipelineState:g_pipe_fourier_basis];
+        [enc_four setBuffer:buf_X offset:0 atIndex:0];
+        [enc_four setBuffer:buf_Phi offset:0 atIndex:1];
         uint u_freqs = (uint)num_freqs;
-        uint u_has_base = (uint)has_base;
-        uint u_has_bias = (uint)has_bias;
+        [enc_four setBytes:&uB length:sizeof(uint) atIndex:2];
+        [enc_four setBytes:&uDin length:sizeof(uint) atIndex:3];
+        [enc_four setBytes:&u_freqs length:sizeof(uint) atIndex:4];
+        [enc_four dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_four endEncoding];
 
-        [enc setBytes:&uB length:sizeof(uint) atIndex:5];
-        [enc setBytes:&uD_in length:sizeof(uint) atIndex:6];
-        [enc setBytes:&uD_out length:sizeof(uint) atIndex:7];
-        [enc setBytes:&u_freqs length:sizeof(uint) atIndex:8];
-        [enc setBytes:&u_has_base length:sizeof(uint) atIndex:9];
-        [enc setBytes:&u_has_bias length:sizeof(uint) atIndex:10];
+        // 4. Matrix multiplication: Y += Phi @ W_fourier.T
+        MPSMatrixDescriptor* desc_A_four = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_B_four = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_C_four = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrix* mat_A_four = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_A_four] autorelease];
+        MPSMatrix* mat_B_four = [[[MPSMatrix alloc] initWithBuffer:buf_W_four descriptor:desc_B_four] autorelease];
+        MPSMatrix* mat_C_four = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_four] autorelease];
+        MPSMatrixMultiplication* matmul_four = get_cached_matmul(g_device, B, D_out, K_dim, 1.0f, 1.0f);
+        [matmul_four encodeToCommandBuffer:cmd leftMatrix:mat_A_four rightMatrix:mat_B_four resultMatrix:mat_C_four];
 
-        MTLSize grid_sz = MTLSizeMake((D_out + 31) / 32, (B + 31) / 32, 1);
-        MTLSize tg   = MTLSizeMake(16, 16, 1);
-        [enc dispatchThreadgroups:grid_sz threadsPerThreadgroup:tg];
-
-        [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
 
@@ -539,48 +633,73 @@ int metal_kan_jacobi_forward(
     int has_bias
 ) {
     @autoreleasepool {
-        id<MTLComputePipelineState> pipe = g_pipe_jacobi_tiled;
-        if (!pipe) return -1;
-
+        int K_dim = D_in * degree;
         id<MTLBuffer> buf_X      = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
-        id<MTLBuffer> buf_W_jac  = make_no_copy_buffer((void*)W_jacobi, D_out * D_in * degree * sizeof(float));
-        id<MTLBuffer> buf_W_base = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : buf_X;
-        id<MTLBuffer> buf_bias   = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : buf_X;
+        id<MTLBuffer> buf_W_jac  = make_no_copy_buffer((void*)W_jacobi, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_bias   = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : nil;
         id<MTLBuffer> buf_Y      = make_no_copy_buffer((void*)Y, B * D_out * sizeof(float));
 
+        id<MTLBuffer> buf_Phi    = get_scratch_phi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
+
         id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pipe];
 
-        [enc setBuffer:buf_X offset:0 atIndex:0];
-        [enc setBuffer:buf_W_jac offset:0 atIndex:1];
-        [enc setBuffer:buf_W_base offset:0 atIndex:2];
-        [enc setBuffer:buf_bias offset:0 atIndex:3];
-        [enc setBuffer:buf_Y offset:0 atIndex:4];
+        // 1. Base SiLU and bias initialization
+        id<MTLComputeCommandEncoder> enc_prep = [cmd computeCommandEncoder];
+        [enc_prep setComputePipelineState:g_pipe_prep];
+        [enc_prep setBuffer:buf_X offset:0 atIndex:0];
+        [enc_prep setBuffer:(buf_bias ? buf_bias : buf_X) offset:0 atIndex:1];
+        [enc_prep setBuffer:(buf_X_silu ? buf_X_silu : buf_X) offset:0 atIndex:2];
+        [enc_prep setBuffer:buf_Y offset:0 atIndex:3];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+        [enc_prep setBytes:&uB length:sizeof(uint) atIndex:4];
+        [enc_prep setBytes:&uDin length:sizeof(uint) atIndex:5];
+        [enc_prep setBytes:&uDout length:sizeof(uint) atIndex:6];
+        [enc_prep setBytes:&uBase length:sizeof(uint) atIndex:7];
+        [enc_prep setBytes:&uBias length:sizeof(uint) atIndex:8];
+        uint max_dim = (D_in > D_out) ? D_in : D_out;
+        [enc_prep dispatchThreads:MTLSizeMake(max_dim, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_prep endEncoding];
 
-        uint uB = (uint)B;
-        uint uD_in = (uint)D_in;
-        uint uD_out = (uint)D_out;
+        // 2. Base linear branch: Y += X_silu @ W_base.T
+        if (has_base) {
+            MPSMatrixDescriptor* desc_A_base = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_B_base = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_C_base = get_cached_desc(B, D_out, D_out * sizeof(float));
+            MPSMatrix* mat_A_base = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_A_base] autorelease];
+            MPSMatrix* mat_B_base = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_B_base] autorelease];
+            MPSMatrix* mat_C_base = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_base] autorelease];
+            MPSMatrixMultiplication* matmul_base = get_cached_matmul(g_device, B, D_out, D_in, 1.0f, 1.0f);
+            [matmul_base encodeToCommandBuffer:cmd leftMatrix:mat_A_base rightMatrix:mat_B_base resultMatrix:mat_C_base];
+        }
+
+        // 3. Jacobi basis evaluation
+        id<MTLComputeCommandEncoder> enc_jac = [cmd computeCommandEncoder];
+        [enc_jac setComputePipelineState:g_pipe_jacobi_basis];
+        [enc_jac setBuffer:buf_X offset:0 atIndex:0];
+        [enc_jac setBuffer:buf_Phi offset:0 atIndex:1];
         uint u_deg = (uint)degree;
-        float u_alpha = alpha;
-        float u_beta = beta;
-        uint u_has_base = (uint)has_base;
-        uint u_has_bias = (uint)has_bias;
+        float u_alpha = alpha, u_beta = beta;
+        [enc_jac setBytes:&uB length:sizeof(uint) atIndex:2];
+        [enc_jac setBytes:&uDin length:sizeof(uint) atIndex:3];
+        [enc_jac setBytes:&u_deg length:sizeof(uint) atIndex:4];
+        [enc_jac setBytes:&u_alpha length:sizeof(float) atIndex:5];
+        [enc_jac setBytes:&u_beta length:sizeof(float) atIndex:6];
+        [enc_jac dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_jac endEncoding];
 
-        [enc setBytes:&uB length:sizeof(uint) atIndex:5];
-        [enc setBytes:&uD_in length:sizeof(uint) atIndex:6];
-        [enc setBytes:&uD_out length:sizeof(uint) atIndex:7];
-        [enc setBytes:&u_deg length:sizeof(uint) atIndex:8];
-        [enc setBytes:&u_alpha length:sizeof(float) atIndex:9];
-        [enc setBytes:&u_beta length:sizeof(float) atIndex:10];
-        [enc setBytes:&u_has_base length:sizeof(uint) atIndex:11];
-        [enc setBytes:&u_has_bias length:sizeof(uint) atIndex:12];
+        // 4. Matrix multiplication: Y += Phi @ W_jacobi.T
+        MPSMatrixDescriptor* desc_A_jac = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_B_jac = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_C_jac = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrix* mat_A_jac = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_A_jac] autorelease];
+        MPSMatrix* mat_B_jac = [[[MPSMatrix alloc] initWithBuffer:buf_W_jac descriptor:desc_B_jac] autorelease];
+        MPSMatrix* mat_C_jac = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_jac] autorelease];
+        MPSMatrixMultiplication* matmul_jac = get_cached_matmul(g_device, B, D_out, K_dim, 1.0f, 1.0f);
+        [matmul_jac encodeToCommandBuffer:cmd leftMatrix:mat_A_jac rightMatrix:mat_B_jac resultMatrix:mat_C_jac];
 
-        MTLSize grid_sz = MTLSizeMake((D_out + 31) / 32, (B + 31) / 32, 1);
-        MTLSize tg   = MTLSizeMake(16, 16, 1);
-        [enc dispatchThreadgroups:grid_sz threadsPerThreadgroup:tg];
-
-        [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
 
@@ -669,50 +788,76 @@ int metal_kan_bspline_forward(
     int has_bias
 ) {
     @autoreleasepool {
-        id<MTLComputePipelineState> pipe = g_pipe_bspline_tiled;
-        if (!pipe) return -1;
-
         uint num_bases = grid_size + 3;
+        int K_dim = D_in * num_bases;
 
         id<MTLBuffer> buf_X      = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
-        id<MTLBuffer> buf_W_spl  = make_no_copy_buffer((void*)W_spline, D_out * D_in * num_bases * sizeof(float));
-        id<MTLBuffer> buf_W_base = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : buf_X;
-        id<MTLBuffer> buf_grid   = make_no_copy_buffer((void*)grid, 2 * sizeof(float));
-        id<MTLBuffer> buf_bias   = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : buf_X;
+        id<MTLBuffer> buf_W_spl  = make_no_copy_buffer((void*)W_spline, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_bias   = has_bias ? make_no_copy_buffer((void*)bias, D_out * sizeof(float)) : nil;
         id<MTLBuffer> buf_Y      = make_no_copy_buffer((void*)Y, B * D_out * sizeof(float));
 
+        id<MTLBuffer> buf_Phi    = get_scratch_phi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
+
         id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pipe];
 
-        [enc setBuffer:buf_X offset:0 atIndex:0];
-        [enc setBuffer:buf_W_spl offset:0 atIndex:1];
-        [enc setBuffer:buf_W_base offset:0 atIndex:2];
-        [enc setBuffer:buf_grid offset:0 atIndex:3];
-        [enc setBuffer:buf_bias offset:0 atIndex:4];
-        [enc setBuffer:buf_Y offset:0 atIndex:5];
+        // 1. Base SiLU and bias initialization
+        id<MTLComputeCommandEncoder> enc_prep = [cmd computeCommandEncoder];
+        [enc_prep setComputePipelineState:g_pipe_prep];
+        [enc_prep setBuffer:buf_X offset:0 atIndex:0];
+        [enc_prep setBuffer:(buf_bias ? buf_bias : buf_X) offset:0 atIndex:1];
+        [enc_prep setBuffer:(buf_X_silu ? buf_X_silu : buf_X) offset:0 atIndex:2];
+        [enc_prep setBuffer:buf_Y offset:0 atIndex:3];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+        [enc_prep setBytes:&uB length:sizeof(uint) atIndex:4];
+        [enc_prep setBytes:&uDin length:sizeof(uint) atIndex:5];
+        [enc_prep setBytes:&uDout length:sizeof(uint) atIndex:6];
+        [enc_prep setBytes:&uBase length:sizeof(uint) atIndex:7];
+        [enc_prep setBytes:&uBias length:sizeof(uint) atIndex:8];
+        uint max_dim = (D_in > D_out) ? D_in : D_out;
+        [enc_prep dispatchThreads:MTLSizeMake(max_dim, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_prep endEncoding];
 
-        uint uB = (uint)B;
-        uint uD_in = (uint)D_in;
-        uint uD_out = (uint)D_out;
+        // 2. Base linear branch: Y += X_silu @ W_base.T
+        if (has_base) {
+            MPSMatrixDescriptor* desc_A_base = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_B_base = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_C_base = get_cached_desc(B, D_out, D_out * sizeof(float));
+            MPSMatrix* mat_A_base = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_A_base] autorelease];
+            MPSMatrix* mat_B_base = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_B_base] autorelease];
+            MPSMatrix* mat_C_base = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_base] autorelease];
+            MPSMatrixMultiplication* matmul_base = get_cached_matmul(g_device, B, D_out, D_in, 1.0f, 1.0f);
+            [matmul_base encodeToCommandBuffer:cmd leftMatrix:mat_A_base rightMatrix:mat_B_base resultMatrix:mat_C_base];
+        }
+
+        // 3. BSpline basis evaluation
+        id<MTLComputeCommandEncoder> enc_spl = [cmd computeCommandEncoder];
+        [enc_spl setComputePipelineState:g_pipe_bspline_basis];
+        [enc_spl setBuffer:buf_X offset:0 atIndex:0];
+        [enc_spl setBuffer:buf_Phi offset:0 atIndex:1];
         uint u_gsize = (uint)grid_size;
-        uint u_sorder = (uint)spline_order;
-        uint u_has_base = (uint)has_base;
-        uint u_has_bias = (uint)has_bias;
+        float grid_min = grid[0];
+        float inv_h = grid[1];
+        [enc_spl setBytes:&uB length:sizeof(uint) atIndex:2];
+        [enc_spl setBytes:&uDin length:sizeof(uint) atIndex:3];
+        [enc_spl setBytes:&u_gsize length:sizeof(uint) atIndex:4];
+        [enc_spl setBytes:&grid_min length:sizeof(float) atIndex:5];
+        [enc_spl setBytes:&inv_h length:sizeof(float) atIndex:6];
+        [enc_spl dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_spl endEncoding];
 
-        [enc setBytes:&uB length:sizeof(uint) atIndex:6];
-        [enc setBytes:&uD_in length:sizeof(uint) atIndex:7];
-        [enc setBytes:&uD_out length:sizeof(uint) atIndex:8];
-        [enc setBytes:&u_gsize length:sizeof(uint) atIndex:9];
-        [enc setBytes:&u_sorder length:sizeof(uint) atIndex:10];
-        [enc setBytes:&u_has_base length:sizeof(uint) atIndex:11];
-        [enc setBytes:&u_has_bias length:sizeof(uint) atIndex:12];
+        // 4. Matrix multiplication: Y += Phi @ W_spline.T
+        MPSMatrixDescriptor* desc_A_spl = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_B_spl = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_C_spl = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrix* mat_A_spl = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_A_spl] autorelease];
+        MPSMatrix* mat_B_spl = [[[MPSMatrix alloc] initWithBuffer:buf_W_spl descriptor:desc_B_spl] autorelease];
+        MPSMatrix* mat_C_spl = [[[MPSMatrix alloc] initWithBuffer:buf_Y descriptor:desc_C_spl] autorelease];
+        MPSMatrixMultiplication* matmul_spl = get_cached_matmul(g_device, B, D_out, K_dim, 1.0f, 1.0f);
+        [matmul_spl encodeToCommandBuffer:cmd leftMatrix:mat_A_spl rightMatrix:mat_B_spl resultMatrix:mat_C_spl];
 
-        MTLSize grid_sz = MTLSizeMake((D_out + 31) / 32, (B + 31) / 32, 1);
-        MTLSize tg   = MTLSizeMake(16, 16, 1);
-        [enc dispatchThreadgroups:grid_sz threadsPerThreadgroup:tg];
-
-        [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
 
@@ -920,6 +1065,168 @@ double benchmark_metal_fastkan(
     uint64_t t0 = mach_absolute_time();
     for (int i = 0; i < iters; i++) {
         metal_kan_fastkan_forward(X, W_rbf, W_base, grid, bias, Y, B, D_in, D_out, num_centers, inv_denominator, has_base, has_bias);
+    }
+    uint64_t t1 = mach_absolute_time();
+
+    double total_sec = (double)(t1 - t0) * g_timebase_factor;
+    return (total_sec / (double)iters) * 1000.0;
+}
+
+int metal_kan_combine_mult_nodes(
+    const float* In,
+    float*       Out,
+    int B,
+    int num_add,
+    int num_mult
+) {
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipe = g_pipe_combine_mult;
+        if (!pipe) return -1;
+
+        int total_in = num_add + 2 * num_mult;
+        int total_out = num_add + num_mult;
+
+        id<MTLBuffer> buf_In  = make_no_copy_buffer((void*)In, B * total_in * sizeof(float));
+        id<MTLBuffer> buf_Out = make_no_copy_buffer((void*)Out, B * total_out * sizeof(float));
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pipe];
+        [enc setBuffer:buf_In offset:0 atIndex:0];
+        [enc setBuffer:buf_Out offset:0 atIndex:1];
+
+        uint uB = (uint)B;
+        uint uAdd = (uint)num_add;
+        uint uMult = (uint)num_mult;
+        [enc setBytes:&uB length:sizeof(uint) atIndex:2];
+        [enc setBytes:&uAdd length:sizeof(uint) atIndex:3];
+        [enc setBytes:&uMult length:sizeof(uint) atIndex:4];
+
+        [enc dispatchThreads:MTLSizeMake(total_out, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        return 0;
+    }
+}
+
+double benchmark_metal_relu(
+    const float* X,
+    const float* W_relu,
+    const float* W_base,
+    const float* grid,
+    const float* bias,
+    float*       Y,
+    int B,
+    int D_in,
+    int D_out,
+    int num_grids,
+    float inv_h,
+    int has_base,
+    int has_bias,
+    int warmup,
+    int iters
+) {
+    for (int i = 0; i < warmup; i++) {
+        metal_kan_relu_forward(X, W_relu, W_base, grid, bias, Y, B, D_in, D_out, num_grids, inv_h, has_base, has_bias);
+    }
+
+    uint64_t t0 = mach_absolute_time();
+    for (int i = 0; i < iters; i++) {
+        metal_kan_relu_forward(X, W_relu, W_base, grid, bias, Y, B, D_in, D_out, num_grids, inv_h, has_base, has_bias);
+    }
+    uint64_t t1 = mach_absolute_time();
+
+    double total_sec = (double)(t1 - t0) * g_timebase_factor;
+    return (total_sec / (double)iters) * 1000.0;
+}
+
+double benchmark_metal_fourier(
+    const float* X,
+    const float* W_fourier,
+    const float* W_base,
+    const float* bias,
+    float*       Y,
+    int B,
+    int D_in,
+    int D_out,
+    int num_freqs,
+    int has_base,
+    int has_bias,
+    int warmup,
+    int iters
+) {
+    for (int i = 0; i < warmup; i++) {
+        metal_kan_fourier_forward(X, W_fourier, W_base, bias, Y, B, D_in, D_out, num_freqs, has_base, has_bias);
+    }
+
+    uint64_t t0 = mach_absolute_time();
+    for (int i = 0; i < iters; i++) {
+        metal_kan_fourier_forward(X, W_fourier, W_base, bias, Y, B, D_in, D_out, num_freqs, has_base, has_bias);
+    }
+    uint64_t t1 = mach_absolute_time();
+
+    double total_sec = (double)(t1 - t0) * g_timebase_factor;
+    return (total_sec / (double)iters) * 1000.0;
+}
+
+double benchmark_metal_jacobi(
+    const float* X,
+    const float* W_jacobi,
+    const float* W_base,
+    const float* bias,
+    float*       Y,
+    int B,
+    int D_in,
+    int D_out,
+    int degree,
+    float alpha,
+    float beta,
+    int has_base,
+    int has_bias,
+    int warmup,
+    int iters
+) {
+    for (int i = 0; i < warmup; i++) {
+        metal_kan_jacobi_forward(X, W_jacobi, W_base, bias, Y, B, D_in, D_out, degree, alpha, beta, has_base, has_bias);
+    }
+
+    uint64_t t0 = mach_absolute_time();
+    for (int i = 0; i < iters; i++) {
+        metal_kan_jacobi_forward(X, W_jacobi, W_base, bias, Y, B, D_in, D_out, degree, alpha, beta, has_base, has_bias);
+    }
+    uint64_t t1 = mach_absolute_time();
+
+    double total_sec = (double)(t1 - t0) * g_timebase_factor;
+    return (total_sec / (double)iters) * 1000.0;
+}
+
+double benchmark_metal_rational(
+    const float* X,
+    const float* W_p,
+    const float* W_q,
+    const float* W_base,
+    const float* bias,
+    float*       Y,
+    int B,
+    int D_in,
+    int D_out,
+    int p_deg,
+    int q_deg,
+    int has_base,
+    int has_bias,
+    int warmup,
+    int iters
+) {
+    for (int i = 0; i < warmup; i++) {
+        metal_kan_rational_forward(X, W_p, W_q, W_base, bias, Y, B, D_in, D_out, p_deg, q_deg, has_base, has_bias);
+    }
+
+    uint64_t t0 = mach_absolute_time();
+    for (int i = 0; i < iters; i++) {
+        metal_kan_rational_forward(X, W_p, W_q, W_base, bias, Y, B, D_in, D_out, p_deg, q_deg, has_base, has_bias);
     }
     uint64_t t1 = mach_absolute_time();
 
