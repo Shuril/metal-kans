@@ -104,18 +104,34 @@ class TestMetalKANsSuite(unittest.TestCase):
         self.assertFalse(np.isnan(y).any())
 
     def test_mult_kan(self):
-        layer = MultKAN(in_features=8, out_features=16, num_mult=4)
+        layer = MultKAN(in_features=8, out_features=16, num_mult=4, use_base=True, bias=True)
         x = np.random.uniform(-1.0, 1.0, (64, 8)).astype(np.float32)
         y = layer(x)
         self.assertEqual(y.shape, (64, 16))
         self.assertFalse(np.isnan(y).any())
 
+        # Ground truth verification
+        internal = layer.sub_layer(x)
+        y_ref = np.zeros_like(y)
+        y_ref[:, :layer.num_add] = internal[:, :layer.num_add]
+        for i in range(layer.num_mult):
+            u = internal[:, layer.num_add + i]
+            v = internal[:, layer.num_add + layer.num_mult + i]
+            y_ref[:, layer.num_add + i] = u * v
+        np.testing.assert_allclose(y, y_ref, atol=1e-5)
+
     def test_low_rank_kan(self):
-        layer = LowRankKAN(in_features=16, out_features=32, rank=4)
+        layer = LowRankKAN(in_features=16, out_features=32, rank=4, use_base=True, bias=True)
         x = np.random.uniform(-1.0, 1.0, (64, 16)).astype(np.float32)
         y = layer(x)
         self.assertEqual(y.shape, (64, 32))
         self.assertFalse(np.isnan(y).any())
+
+        # Ground truth verification
+        z = layer.down_layer(x)
+        silu_x = x / (1.0 + np.exp(-x))
+        y_ref = (z @ layer.w_up.T) + (silu_x @ layer.w_base.T) + layer.bias
+        np.testing.assert_allclose(y, y_ref, atol=1e-4)
 
     # -----------------------------------------------------------------------
     # 2. Multi-Layer MetalKAN Network Tests for All 10 Architectures

@@ -119,42 +119,42 @@ Batch Size   | Latency (ms)    | Throughput (samples/sec) | Intermediate VRAM
 ```
 *(Peak single-layer throughput reaches **11.6+ Million samples/sec** on base Apple Silicon).*
 
-### 3-Way GPU Benchmark: MLX vs metal-KANs (v0.3.0) vs slang-KANs (v0.2.0)
+### 3-Way GPU Benchmark: MLX vs metal-KANs (v0.3.1) vs slang-KANs (v0.2.0)
 
 Tested across all 10 architectures on **Apple Silicon GPU**, Layer `64 -> 64`:
 
 | Architecture | Batch | MLX (ms) | metal-KANs (Pure Metal AMX) | slang-KANs (Shared-Memory GEMM) | Winner (Speedup) |
 |---|---|---|---|---|---|
-| **ChebyKAN** | 128 | 0.321 ms | 0.350 ms | **0.166 ms** | **slang-KANs (1.94x)** |
-| | 1024 | 1.269 ms | 0.509 ms | **0.369 ms** | **slang-KANs (1.38x)** |
-| | 4096 | 1.383 ms | **0.653 ms** | 0.892 ms | **metal-KANs (1.37x)** |
-| **BSplineKAN** | 128 | 0.359 ms | 0.290 ms | **0.132 ms** | **slang-KANs (2.20x)** |
-| | 1024 | 0.777 ms | **0.457 ms** | 0.545 ms | **metal-KANs (1.19x)** |
-| | 4096 | 2.092 ms | **0.902 ms** | 1.402 ms | **metal-KANs (1.56x)** |
-| **FastKAN** | 128 | **0.267 ms** | 0.297 ms | 0.696 ms | **MLX (1.11x)** |
-| | 1024 | 0.446 ms | **0.399 ms** | 1.463 ms | **metal-KANs (1.12x)** |
-| | 4096 | 1.445 ms | **1.177 ms** | 4.739 ms | **metal-KANs (1.23x)** |
-| **WavKAN** | 128 | **0.335 ms** | 0.411 ms | 0.833 ms | **MLX (1.23x)** |
-| | 1024 | 1.528 ms | **0.567 ms** | 1.835 ms | **metal-KANs (2.69x)** |
-| | 4096 | 1.222 ms | **0.984 ms** | 3.762 ms | **metal-KANs (1.24x)** |
-| **ReLUKAN** | 128 | **0.309 ms** | 0.378 ms | 0.861 ms | **MLX (1.22x)** |
-| | 1024 | **0.513 ms** | 0.557 ms | 1.840 ms | **MLX (1.08x)** |
-| | 4096 | **1.093 ms** | 1.135 ms | 3.250 ms | **MLX (1.04x)** |
-| **FourierKAN** | 128 | **0.321 ms** | 0.381 ms | 0.896 ms | **MLX (1.19x)** |
-| | 1024 | 0.872 ms | **0.641 ms** | 1.969 ms | **metal-KANs (1.36x)** |
-| | 4096 | 2.219 ms | **0.928 ms** | 2.565 ms | **metal-KANs (2.39x)** |
-| **JacobiKAN** | 128 | 0.292 ms | 0.298 ms | **0.144 ms** | **slang-KANs (2.03x)** |
-| | 1024 | 0.578 ms | 0.465 ms | **0.359 ms** | **slang-KANs (1.30x)** |
-| | 4096 | 1.521 ms | **0.574 ms** | 0.727 ms | **metal-KANs (1.27x)** |
-| **RationalKAN**| 128 | 0.679 ms | 0.403 ms | **0.132 ms** | **slang-KANs (3.05x)** |
-| | 1024 | 4.070 ms | 0.850 ms | **0.652 ms** | **slang-KANs (1.30x)** |
-| | 4096 | 18.252 ms| 2.453 ms | **2.393 ms** | **slang-KANs (1.02x)** |
-| **MultKAN** | 128 | **0.320 ms** | 0.509 ms | 0.803 ms | **MLX (1.59x)** |
-| | 1024 | **0.428 ms** | 0.707 ms | 1.561 ms | **MLX (1.65x)** |
-| | 4096 | **1.529 ms** | 1.853 ms | 6.638 ms | **MLX (1.21x)** |
-| **LowRankKAN** | 128 | 0.344 ms | 0.454 ms | **0.301 ms** | **slang-KANs (1.14x)** |
-| | 1024 | **0.608 ms** | 0.829 ms | 3.306 ms | **MLX (1.36x)** |
-| | 4096 | **1.442 ms** | 2.257 ms | 11.785 ms| **MLX (1.57x)** |
+| **ChebyKAN** | 128 | 0.387 ms | 0.295 ms | **0.226 ms** | **slang-KANs (1.30x)** |
+| | 1024 | 0.526 ms | 0.372 ms | **0.324 ms** | **slang-KANs (1.15x)** |
+| | 4096 | 1.380 ms | **0.484 ms** | 0.885 ms | **metal-KANs (1.83x)** |
+| **BSplineKAN** | 128 | 0.354 ms | 0.258 ms | **0.136 ms** | **slang-KANs (1.90x)** |
+| | 1024 | 0.835 ms | **0.404 ms** | 0.541 ms | **metal-KANs (1.34x)** |
+| | 4096 | 2.190 ms | **0.826 ms** | 1.400 ms | **metal-KANs (1.70x)** |
+| **FastKAN** | 128 | 0.270 ms | **0.254 ms** | 0.692 ms | **metal-KANs (1.06x)** |
+| | 1024 | 0.398 ms | **0.352 ms** | 1.439 ms | **metal-KANs (1.13x)** |
+| | 4096 | 1.475 ms | **1.006 ms** | 4.010 ms | **metal-KANs (1.47x)** |
+| **WavKAN** | 128 | **0.354 ms** | 0.367 ms | 0.869 ms | **MLX (1.04x)** |
+| | 1024 | 1.845 ms | **0.541 ms** | 1.941 ms | **metal-KANs (3.41x)** |
+| | 4096 | 1.844 ms | **1.189 ms** | 4.132 ms | **metal-KANs (1.55x)** |
+| **ReLUKAN** | 128 | **0.311 ms** | 0.364 ms | 0.852 ms | **MLX (1.17x)** |
+| | 1024 | 0.542 ms | **0.511 ms** | 1.888 ms | **metal-KANs (1.06x)** |
+| | 4096 | 1.254 ms | **1.062 ms** | 4.134 ms | **metal-KANs (1.18x)** |
+| **FourierKAN** | 128 | **0.351 ms** | 0.384 ms | 0.883 ms | **MLX (1.09x)** |
+| | 1024 | 0.975 ms | **0.605 ms** | 2.098 ms | **metal-KANs (1.61x)** |
+| | 4096 | 2.385 ms | **0.868 ms** | 2.868 ms | **metal-KANs (2.75x)** |
+| **JacobiKAN** | 128 | 0.405 ms | 0.294 ms | **0.144 ms** | **slang-KANs (2.04x)** |
+| | 1024 | 0.632 ms | 0.415 ms | **0.325 ms** | **slang-KANs (1.28x)** |
+| | 4096 | 1.413 ms | **0.515 ms** | 0.722 ms | **metal-KANs (1.40x)** |
+| **RationalKAN**| 128 | 0.691 ms | 0.385 ms | **0.166 ms** | **slang-KANs (2.32x)** |
+| | 1024 | 4.354 ms | 0.822 ms | **0.648 ms** | **slang-KANs (1.27x)** |
+| | 4096 | 18.225 ms| **2.300 ms** | 2.468 ms | **metal-KANs (1.07x)** |
+| **MultKAN** | 128 | 0.378 ms | **0.278 ms** | 0.783 ms | **metal-KANs (1.36x)** |
+| | 1024 | 0.494 ms | **0.415 ms** | 3.738 ms | **metal-KANs (1.19x)** |
+| | 4096 | 2.179 ms | **1.526 ms** | 7.734 ms | **metal-KANs (1.43x)** |
+| **LowRankKAN** | 128 | **0.514 ms** | 0.546 ms | 0.811 ms | **MLX (1.06x)** |
+| | 1024 | 0.866 ms | **0.612 ms** | 8.050 ms | **metal-KANs (1.41x)** |
+| | 4096 | 1.722 ms | **1.101 ms** | 27.890 ms| **metal-KANs (1.56x)** |
 
 ---
 

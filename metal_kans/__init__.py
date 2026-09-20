@@ -20,7 +20,7 @@ from .pruning import compute_node_importance, prune, compact_kan
 from .symbolic import to_symbolic, SymbolicKAN, SymbolicEdge
 from .utils import count_parameters, get_model_size
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     # 10 KAN Architectures

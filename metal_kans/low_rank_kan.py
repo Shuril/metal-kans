@@ -8,6 +8,7 @@ import math
 import numpy as np
 from typing import Optional, Sequence
 from .fast_kan import FastKAN
+from .device import get_metal_bridge
 
 
 class LowRankKAN:
@@ -38,7 +39,9 @@ class LowRankKAN:
         self.out_features = out_features
         self.rank = min(rank, out_features, in_features * num_grids)
         self.num_grids = num_grids
-        self.has_bias = bias
+        self.has_bias = 1 if bias else 0
+        self.has_base = 1 if use_base else 0
+        self.use_base = use_base
 
         # Down-projection fused kernel to rank r
         self.down_layer = FastKAN(
@@ -48,19 +51,23 @@ class LowRankKAN:
             bias=False,
             use_base=False,
         )
+        self.w_down = self.down_layer.w_rbf
+        self.grid = self.down_layer.grid
+        self.inv_denominator = self.down_layer.inv_denominator
 
         # Up-projection matrix (rank -> out_features)
         bound = 1.0 / math.sqrt(self.rank)
         self.w_up = np.random.uniform(-bound, bound, (out_features, self.rank)).astype(np.float32)
 
         # Base connection (SiLU) and bias
-        self.use_base = use_base
         bound_base = 1.0 / math.sqrt(in_features)
-        self.w_base = np.random.uniform(-bound_base, bound_base, (out_features, in_features)).astype(np.float32) if use_base else None
-        self.bias = np.zeros((out_features,), dtype=np.float32) if bias else None
+        self.w_base = np.random.uniform(-bound_base, bound_base, (out_features, in_features)).astype(np.float32) if use_base else np.zeros((1,), dtype=np.float32)
+        self.bias = np.zeros((out_features,), dtype=np.float32) if bias else np.zeros((1,), dtype=np.float32)
+
+        self._bridge = get_metal_bridge()
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """Executes down-projection on Metal GPU followed by up-projection."""
+        """Executes chained down-projection and up-projection on Metal GPU."""
         if not isinstance(x, np.ndarray):
             x = np.asarray(x, dtype=np.float32)
         elif x.dtype != np.float32:
@@ -69,20 +76,26 @@ class LowRankKAN:
         orig_shape = x.shape
         if x.ndim > 2:
             x = x.reshape(-1, self.in_features)
+        if not x.flags['C_CONTIGUOUS']:
+            x = np.ascontiguousarray(x)
 
-        # 1. Down-projection to bottleneck rank on GPU
-        z = self.down_layer(x)  # [B, rank]
+        B, D_in = x.shape
+        if D_in != self.in_features:
+            raise ValueError(f"Expected in_features={self.in_features}, got {D_in}")
 
-        # 2. Up-projection
-        y = z @ self.w_up.T  # [B, out_features]
+        y = np.empty((B, self.out_features), dtype=np.float32)
 
-        # 3. Base residual
-        if self.use_base and self.w_base is not None:
-            silu_x = x / (1.0 + np.exp(-x))
-            y = y + (silu_x @ self.w_base.T)
-
-        if self.bias is not None:
-            y = y + self.bias
+        self._bridge.metal_kan_lowrank_forward(
+            x.ctypes.data,
+            self.w_down.ctypes.data,
+            self.w_up.ctypes.data,
+            self.w_base.ctypes.data,
+            self.grid.ctypes.data,
+            self.bias.ctypes.data,
+            y.ctypes.data,
+            B, D_in, self.out_features, self.rank, self.num_grids, self.inv_denominator,
+            self.has_base, self.has_bias
+        )
 
         if len(orig_shape) > 2:
             return y.reshape(*orig_shape[:-1], self.out_features)
@@ -91,12 +104,28 @@ class LowRankKAN:
     __call__ = forward
 
     def benchmark(self, x: np.ndarray, warmup: int = 10, iters: int = 50) -> float:
-        """Benchmarks forward execution in milliseconds."""
-        for _ in range(warmup):
-            self.forward(x)
-        import time
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            self.forward(x)
-        t1 = time.perf_counter()
-        return ((t1 - t0) / iters) * 1000.0
+        """Benchmarks forward execution in milliseconds directly on GPU."""
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x, dtype=np.float32)
+        elif x.dtype != np.float32:
+            x = x.astype(np.float32)
+
+        x_flat = x.reshape(-1, self.in_features)
+        if not x_flat.flags['C_CONTIGUOUS']:
+            x_flat = np.ascontiguousarray(x_flat)
+
+        B, D_in = x_flat.shape
+        y = np.empty((B, self.out_features), dtype=np.float32)
+
+        return self._bridge.benchmark_metal_lowrank(
+            x_flat.ctypes.data,
+            self.w_down.ctypes.data,
+            self.w_up.ctypes.data,
+            self.w_base.ctypes.data,
+            self.grid.ctypes.data,
+            self.bias.ctypes.data,
+            y.ctypes.data,
+            B, D_in, self.out_features, self.rank, self.num_grids, self.inv_denominator,
+            self.has_base, self.has_bias,
+            warmup, iters
+        )
