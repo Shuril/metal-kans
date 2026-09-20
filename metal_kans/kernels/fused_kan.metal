@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_matrix>
 using namespace metal;
 
 // ==============================================================================
@@ -1222,3 +1223,402 @@ kernel void kan_bspline_tiled(
     if (row1 < B && col0 < D_out) Y[row1 * D_out + col0] = acc10;
     if (row1 < B && col1 < D_out) Y[row1 * D_out + col1] = acc11;
 }
+
+// ==============================================================================
+// 10. DIRECT SIMDGROUP MATRIX KERNELS (APPLE SILICON GPU TENSOR CORES)
+// Uses native MSL 3.0 simdgroup_matrix<8, 8> to execute matrix multiplication
+// directly inside hardware execution units without MPS framework dispatch overhead.
+// ==============================================================================
+
+kernel void gemm_simd_16x16_fp32(
+    device const float* A          [[buffer(0)]], // [M, K]
+    device const float* B_mat      [[buffer(1)]], // [N, K]
+    device const float* bias       [[buffer(2)]], // [N]
+    device float*       C          [[buffer(3)]], // [M, N]
+    constant uint&      M          [[buffer(4)]],
+    constant uint&      N          [[buffer(5)]],
+    constant uint&      K          [[buffer(6)]],
+    constant float&     alpha      [[buffer(7)]],
+    constant float&     beta       [[buffer(8)]],
+    constant uint&      has_bias   [[buffer(9)]],
+    uint2               tgid       [[threadgroup_position_in_grid]],
+    uint                simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                s_lane     [[thread_index_in_simdgroup]]
+) {
+    uint tile_row = tgid.y * 16;
+    uint tile_col = tgid.x * 16;
+
+    uint sub_row = (simd_id / 2) * 8;
+    uint sub_col = (simd_id % 2) * 8;
+
+    uint r = tile_row + sub_row;
+    uint c = tile_col + sub_col;
+
+    if (r >= M || c >= N) return;
+
+    simdgroup_matrix<float, 8, 8> accum(0.0f);
+    simdgroup_matrix<float, 8, 8> matA;
+    simdgroup_matrix<float, 8, 8> matB;
+
+    for (uint k = 0; k < K; k += 8) {
+        simdgroup_load(matA, A + r * K + k, K);
+        simdgroup_load(matB, B_mat + c * K + k, K);
+        simdgroup_multiply_accumulate(accum, matA, matB, accum);
+    }
+
+    threadgroup float temp[4][8][8];
+    simdgroup_store(accum, &temp[simd_id][0][0], 8);
+
+    uint idx0 = s_lane * 2;
+    uint idx1 = idx0 + 1;
+
+    uint r0 = idx0 / 8, c0 = idx0 % 8;
+    uint r1 = idx1 / 8, c1 = idx1 % 8;
+
+    uint gr0 = r + r0, gc0 = c + c0;
+    uint gr1 = r + r1, gc1 = c + c1;
+
+    if (gr0 < M && gc0 < N) {
+        float b_val = (has_bias && bias) ? bias[gc0] : 0.0f;
+        float old_val = (beta != 0.0f) ? C[gr0 * N + gc0] : 0.0f;
+        C[gr0 * N + gc0] = temp[simd_id][r0][c0] * alpha + old_val * beta + b_val;
+    }
+    if (gr1 < M && gc1 < N) {
+        float b_val = (has_bias && bias) ? bias[gc1] : 0.0f;
+        float old_val = (beta != 0.0f) ? C[gr1 * N + gc1] : 0.0f;
+        C[gr1 * N + gc1] = temp[simd_id][r1][c1] * alpha + old_val * beta + b_val;
+    }
+}
+
+// Single-pass Fused LowRankKAN Kernel for small and medium batches
+kernel void fused_lowrank_simd_fp32(
+    device const float* X          [[buffer(0)]], // [B, D_in]
+    device const float* W_down     [[buffer(1)]], // [rank, D_in * K]
+    device const float* W_up       [[buffer(2)]], // [D_out, rank]
+    device const float* W_base     [[buffer(3)]], // [D_out, D_in]
+    device const float* grid       [[buffer(4)]], // [K]
+    device const float* bias       [[buffer(5)]], // [D_out]
+    device float*       Y          [[buffer(6)]], // [B, D_out]
+    constant uint&      B          [[buffer(7)]],
+    constant uint&      D_in       [[buffer(8)]],
+    constant uint&      D_out      [[buffer(9)]],
+    constant uint&      rank       [[buffer(10)]],
+    constant uint&      K          [[buffer(11)]],
+    constant float&     inv_den    [[buffer(12)]],
+    constant uint&      has_base   [[buffer(13)]],
+    constant uint&      has_bias   [[buffer(14)]],
+    uint2               tgid       [[threadgroup_position_in_grid]],
+    uint                lid        [[thread_index_in_threadgroup]]
+) {
+    uint b = tgid.y;
+    if (b >= B) return;
+
+    threadgroup float s_Z[64];
+
+    // Cooperatively evaluate bottleneck Z
+    if (lid < rank && rank <= 64) {
+        uint r = lid;
+        float sum_r = 0.0f;
+        for (uint i = 0; i < D_in; i++) {
+            float x_val = X[b * D_in + i];
+            for (uint k = 0; k < K; k++) {
+                float diff = x_val - grid[k];
+                sum_r += exp(-diff * diff * inv_den) * W_down[r * (D_in * K) + i * K + k];
+            }
+        }
+        s_Z[r] = sum_r;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute output features Y[b, j]
+    for (uint j = lid; j < D_out; j += 64) {
+        float acc = (has_bias && bias) ? bias[j] : 0.0f;
+        for (uint r = 0; r < rank; r++) {
+            acc += s_Z[r] * W_up[j * rank + r];
+        }
+        if (has_base && W_base) {
+            for (uint i = 0; i < D_in; i++) {
+                float x_val = X[b * D_in + i];
+                float silu_x = x_val / (1.0f + exp(-x_val));
+                acc += silu_x * W_base[j * D_in + i];
+            }
+        }
+        Y[b * D_out + j] = acc;
+    }
+}
+
+// ==============================================================================
+// 11. FP16 (HALF-PRECISION) BASIS GENERATORS
+// 2x higher throughput, 2x memory reduction on Apple Silicon
+// ==============================================================================
+
+kernel void eval_base_and_bias_fp16(
+    device const half* X        [[buffer(0)]], // [B, D_in]
+    device const half* bias     [[buffer(1)]], // [D_out]
+    device half*       X_silu   [[buffer(2)]], // [B, D_in]
+    device half*       Y        [[buffer(3)]], // [B, D_out]
+    constant uint&     B        [[buffer(4)]],
+    constant uint&     D_in     [[buffer(5)]],
+    constant uint&     D_out    [[buffer(6)]],
+    constant uint&     has_base [[buffer(7)]],
+    constant uint&     has_bias [[buffer(8)]],
+    uint2              tid      [[thread_position_in_grid]]
+) {
+    uint idx = tid.x;
+    uint b   = tid.y;
+    if (b >= B) return;
+
+    if (has_base && idx < D_in) {
+        half x = X[b * D_in + idx];
+        X_silu[b * D_in + idx] = x / (1.0h + exp(-x));
+    }
+
+    if (idx < D_out) {
+        Y[b * D_out + idx] = (has_bias && bias) ? bias[idx] : 0.0h;
+    }
+}
+
+kernel void eval_cheby_basis_fp16(
+    device const half* X       [[buffer(0)]], // [B, D_in]
+    device half*       Phi     [[buffer(1)]], // [B, D_in * K]
+    constant uint&     B       [[buffer(2)]],
+    constant uint&     D_in    [[buffer(3)]],
+    constant uint&     K       [[buffer(4)]],
+    uint2              tid     [[thread_position_in_grid]]
+) {
+    uint b = tid.y;
+    uint i = tid.x;
+    if (b >= B || i >= D_in) return;
+
+    half x = X[b * D_in + i];
+    x = clamp(x, half(-1.0h), half(1.0h));
+
+    uint base_idx = b * (D_in * K) + i * K;
+    half t0 = 1.0h;
+    half t1 = x;
+
+    Phi[base_idx + 0] = t0;
+    if (K > 1) Phi[base_idx + 1] = t1;
+
+    for (uint k = 2; k < K; k++) {
+        half t2 = 2.0h * x * t1 - t0;
+        Phi[base_idx + k] = t2;
+        t0 = t1;
+        t1 = t2;
+    }
+}
+
+kernel void eval_fastkan_rbf_basis_fp16(
+    device const half* X                [[buffer(0)]], // [B, D_in]
+    device const half* grid             [[buffer(1)]], // [K]
+    device half*       Phi              [[buffer(2)]], // [B, D_in * K]
+    constant uint&     B                [[buffer(3)]],
+    constant uint&     D_in             [[buffer(4)]],
+    constant uint&     K                [[buffer(5)]],
+    constant float&    inv_denominator [[buffer(6)]],
+    uint2              tid              [[thread_position_in_grid]]
+) {
+    uint b = tid.y;
+    uint i = tid.x;
+    if (b >= B || i >= D_in) return;
+
+    half x = X[b * D_in + i];
+    uint base_idx = b * (D_in * K) + i * K;
+    half inv_den = half(inv_denominator);
+
+    for (uint k = 0; k < K; k++) {
+        half diff = x - grid[k];
+        Phi[base_idx + k] = exp(-diff * diff * inv_den);
+    }
+}
+
+kernel void eval_relu_basis_fp16(
+    device const half* X                [[buffer(0)]], // [B, D_in]
+    device const half* grid             [[buffer(1)]], // [K]
+    device half*       Phi              [[buffer(2)]], // [B, D_in * K]
+    constant uint&     B                [[buffer(3)]],
+    constant uint&     D_in             [[buffer(4)]],
+    constant uint&     K                [[buffer(5)]],
+    constant float&    inv_denominator [[buffer(6)]],
+    uint2              tid              [[thread_position_in_grid]]
+) {
+    uint b = tid.y;
+    uint i = tid.x;
+    if (b >= B || i >= D_in) return;
+
+    half x = X[b * D_in + i];
+    uint base_idx = b * (D_in * K) + i * K;
+    half inv_den = half(inv_denominator);
+
+    for (uint k = 0; k < K; k++) {
+        half diff = abs(x - grid[k]) * inv_den;
+        Phi[base_idx + k] = max(half(0.0h), 1.0h - diff);
+    }
+}
+
+kernel void eval_bspline_basis_fp16(
+    device const half*  X            [[buffer(0)]],
+    device half*        Phi          [[buffer(1)]],
+    constant uint&       B            [[buffer(2)]],
+    constant uint&       D_in         [[buffer(3)]],
+    constant uint&       grid_size    [[buffer(4)]],
+    constant float&      grid_min     [[buffer(5)]],
+    constant float&      inv_h        [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    half x = X[b * D_in + din];
+    uint num_bases = grid_size + 3;
+    uint out_offset = b * (D_in * num_bases) + din * num_bases;
+
+    for (uint i = 0; i < num_bases; i++) {
+        Phi[out_offset + i] = 0.0h;
+    }
+
+    float pos = (float(x) - grid_min) * inv_h;
+    int span = clamp((int)floor(pos), 0, (int)grid_size - 1);
+    float u = clamp(pos - (float)span, 0.0f, 1.0f);
+    float one_sub_u = 1.0f - u;
+
+    float b0 = (one_sub_u * one_sub_u * one_sub_u) * (1.0f / 6.0f);
+    float b1 = (3.0f * u * u * u - 6.0f * u * u + 4.0f) * (1.0f / 6.0f);
+    float b2 = (-3.0f * u * u * u + 3.0f * u * u + 3.0f * u + 1.0f) * (1.0f / 6.0f);
+    float b3 = (u * u * u) * (1.0f / 6.0f);
+
+    Phi[out_offset + span + 0] = half(b0);
+    Phi[out_offset + span + 1] = half(b1);
+    Phi[out_offset + span + 2] = half(b2);
+    Phi[out_offset + span + 3] = half(b3);
+}
+
+kernel void eval_wavkan_basis_fp16(
+    device const half* X            [[buffer(0)]], // [B, D_in]
+    device const half* translation  [[buffer(1)]], // [D_in, num_wavelets]
+    device const half* inv_scale    [[buffer(2)]], // [D_in, num_wavelets]
+    device half*       Phi          [[buffer(3)]], // [B, D_in * num_wavelets]
+    constant uint&     B            [[buffer(4)]],
+    constant uint&     D_in         [[buffer(5)]],
+    constant uint&     num_wavelets [[buffer(6)]],
+    constant uint&     wavelet_type [[buffer(7)]],
+    uint2              tid          [[thread_position_in_grid]]
+) {
+    uint b = tid.y;
+    uint i = tid.x;
+    if (b >= B || i >= D_in) return;
+
+    half x = X[b * D_in + i];
+    uint base_idx = b * (D_in * num_wavelets) + i * num_wavelets;
+
+    for (uint w = 0; w < num_wavelets; w++) {
+        half tr = translation[i * num_wavelets + w];
+        half sc = inv_scale[i * num_wavelets + w];
+        half z = (x - tr) * sc;
+        half psi = 0.0h;
+
+        if (wavelet_type == 0) { // Mexican Hat
+            psi = (1.0h - z * z) * exp(-0.5h * z * z);
+        } else if (wavelet_type == 1) { // Morlet
+            psi = cos(1.75h * z) * exp(-0.5h * z * z);
+        } else { // Derivative of Gaussian (DOG)
+            psi = -z * exp(-0.5h * z * z);
+        }
+
+        Phi[base_idx + w] = psi;
+    }
+}
+
+kernel void eval_fourier_basis_fp16(
+    device const half* X          [[buffer(0)]], // [B, D_in]
+    device half*       Phi        [[buffer(1)]], // [B, D_in * (2 * num_freqs + 1)]
+    constant uint&     B          [[buffer(2)]],
+    constant uint&     D_in       [[buffer(3)]],
+    constant uint&     num_freqs  [[buffer(4)]],
+    uint2              tid        [[thread_position_in_grid]]
+) {
+    uint b = tid.y;
+    uint i = tid.x;
+    if (b >= B || i >= D_in) return;
+
+    half x = X[b * D_in + i];
+    uint num_bases = 2 * num_freqs + 1;
+    uint base_idx = b * (D_in * num_bases) + i * num_bases;
+
+    Phi[base_idx + 0] = 1.0h;
+    half pi_x = half(3.1415926535h) * x;
+
+    for (uint k = 1; k <= num_freqs; k++) {
+        half angle = half(k) * pi_x;
+        Phi[base_idx + 2 * k - 1] = cos(angle);
+        Phi[base_idx + 2 * k]     = sin(angle);
+    }
+}
+
+kernel void eval_jacobi_basis_fp16(
+    device const half*  X         [[buffer(0)]],
+    device half*        Phi       [[buffer(1)]],
+    constant uint&      B         [[buffer(2)]],
+    constant uint&      D_in      [[buffer(3)]],
+    constant uint&      degree    [[buffer(4)]],
+    constant float&     alpha     [[buffer(5)]],
+    constant float&     beta      [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+    float x = clamp(float(X[b * D_in + din]), -1.0f, 1.0f);
+    uint out_offset = b * (D_in * degree) + din * degree;
+    float a_b = alpha + beta;
+
+    float p_prev2 = 1.0f;
+    Phi[out_offset + 0] = half(p_prev2);
+    if (degree > 1) {
+        float p_prev1 = 0.5f * (alpha - beta + (a_b + 2.0f) * x);
+        Phi[out_offset + 1] = half(p_prev1);
+        for (uint n = 2; n < degree; n++) {
+            float fn = (float)n;
+            float an = 2.0f * fn * (fn + a_b) * (2.0f * fn + a_b - 2.0f);
+            float bn1 = (2.0f * fn + a_b - 1.0f) * (2.0f * fn + a_b) * (2.0f * fn + a_b - 2.0f);
+            float bn2 = (2.0f * fn + a_b - 1.0f) * (alpha * alpha - beta * beta);
+            float cn = 2.0f * (fn + alpha - 1.0f) * (fn + beta - 1.0f) * (2.0f * fn + a_b);
+
+            float p_curr = ((bn1 * x + bn2) * p_prev1 - cn * p_prev2) / an;
+            Phi[out_offset + n] = half(p_curr);
+            p_prev2 = p_prev1;
+            p_prev1 = p_curr;
+        }
+    }
+}
+
+kernel void combine_mult_nodes_fp16(
+    device const half* internal_out [[buffer(0)]], // [B, num_add + 2 * num_mult]
+    device half*       final_out    [[buffer(1)]], // [B, num_add + num_mult]
+    constant uint&     B            [[buffer(2)]],
+    constant uint&     num_add      [[buffer(3)]],
+    constant uint&     num_mult     [[buffer(4)]],
+    uint2              tid          [[thread_position_in_grid]]
+) {
+    uint b = tid.y;
+    uint j = tid.x;
+    if (b >= B) return;
+
+    uint total_out = num_add + num_mult;
+    if (j >= total_out) return;
+
+    uint internal_width = num_add + 2 * num_mult;
+    device const half* row_in = internal_out + b * internal_width;
+    device half* row_out = final_out + b * total_out;
+
+    if (j < num_add) {
+        row_out[j] = row_in[j];
+    } else {
+        uint m_idx = j - num_add;
+        half u = row_in[num_add + m_idx];
+        half v = row_in[num_add + num_mult + m_idx];
+        row_out[j] = u * v;
+    }
+}
+

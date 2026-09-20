@@ -265,6 +265,87 @@ int main() {{
         self.assertGreater(size_info["bytes"], 0)
         self.assertIn("MB", size_info["summary"])
 
+    # -----------------------------------------------------------------------
+    # 7. FP16 Half Precision & Asynchronous Pipelining Tests
+    # -----------------------------------------------------------------------
+    def test_fp16_execution(self):
+        """Validates native FP16 half precision parity against FP32 across architectures."""
+        # ChebyKAN
+        cheby = ChebyKAN(8, 16, degree=4)
+        x = np.random.uniform(-1.0, 1.0, (64, 8)).astype(np.float32)
+        y_fp32 = cheby(x)
+        cheby.half()
+        y_fp16 = cheby(x.astype(np.float16))
+        self.assertEqual(y_fp16.dtype, np.float16)
+        np.testing.assert_allclose(y_fp16.astype(np.float32), y_fp32, atol=1e-2)
+
+        # FastKAN
+        fastkan = FastKAN(8, 16, num_centers=8)
+        y_fp32 = fastkan(x)
+        fastkan.half()
+        y_fp16 = fastkan(x.astype(np.float16))
+        self.assertEqual(y_fp16.dtype, np.float16)
+        np.testing.assert_allclose(y_fp16.astype(np.float32), y_fp32, atol=1e-2)
+
+        # ReLUKAN
+        relu = ReLUKAN(8, 16, num_grids=8)
+        y_fp32 = relu(x)
+        relu.half()
+        y_fp16 = relu(x.astype(np.float16))
+        self.assertEqual(y_fp16.dtype, np.float16)
+        np.testing.assert_allclose(y_fp16.astype(np.float32), y_fp32, atol=1e-2)
+
+        # LowRankKAN
+        lowrank = LowRankKAN(16, 32, rank=4, use_base=True, bias=True)
+        x_lr = np.random.uniform(-1.0, 1.0, (64, 16)).astype(np.float32)
+        y_fp32 = lowrank(x_lr)
+        lowrank.half()
+        y_fp16 = lowrank(x_lr.astype(np.float16))
+        self.assertEqual(y_fp16.dtype, np.float16)
+        np.testing.assert_allclose(y_fp16.astype(np.float32), y_fp32, atol=1e-2)
+
+        # MultKAN
+        mult = MultKAN(8, 16, num_mult=4, use_base=True, bias=True)
+        y_fp32 = mult(x)
+        mult.half()
+        y_fp16 = mult(x.astype(np.float16))
+        self.assertEqual(y_fp16.dtype, np.float16)
+        np.testing.assert_allclose(y_fp16.astype(np.float32), y_fp32, atol=1e-2)
+
+        # BSplineKAN
+        bspline = BSplineKAN(8, 16, grid_size=5, spline_order=3)
+        x_sp = np.random.uniform(-0.9, 0.9, (64, 8)).astype(np.float32)
+        y_fp32 = bspline(x_sp)
+        bspline.half()
+        y_fp16 = bspline(x_sp.astype(np.float16))
+        self.assertEqual(y_fp16.dtype, np.float16)
+        np.testing.assert_allclose(y_fp16.astype(np.float32), y_fp32, atol=1e-2)
+
+        # WavKAN
+        wav = WavKAN(8, 16, num_wavelets=6)
+        y_fp32 = wav(x)
+        wav.half()
+        y_fp16 = wav(x.astype(np.float16))
+        self.assertEqual(y_fp16.dtype, np.float16)
+        np.testing.assert_allclose(y_fp16.astype(np.float32), y_fp32, atol=1e-2)
+
+    def test_async_pipelining(self):
+        """Validates asynchronous streaming execution across batch queues."""
+        net = MetalKAN([8, 16, 2], basis_type="fastkan", degree=8)
+        batches = [np.random.uniform(-1.0, 1.0, (32, 8)).astype(np.float32) for _ in range(8)]
+        
+        # Synchronous ground truth
+        y_sync = [net(b) for b in batches]
+        
+        # Async stream
+        y_async = net.async_stream(batches)
+        
+        self.assertEqual(len(y_async), len(batches))
+        for y_s, y_a in zip(y_sync, y_async):
+            self.assertEqual(y_a.shape, (32, 2))
+            np.testing.assert_allclose(y_a, y_s, atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
+

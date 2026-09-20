@@ -48,12 +48,35 @@ class JacobiKAN:
 
         self._bridge = get_metal_bridge()
 
+    @property
+    def dtype(self) -> np.dtype:
+        return self.w_jacobi.dtype
+
+    def half(self) -> JacobiKAN:
+        """Converts layer parameters to FP16 half precision."""
+        self.w_jacobi = self.w_jacobi.astype(np.float16)
+        if self.has_base:
+            self.w_base = self.w_base.astype(np.float16)
+        if self.has_bias:
+            self.bias = self.bias.astype(np.float16)
+        return self
+
+    def float(self) -> JacobiKAN:
+        """Converts layer parameters to FP32 single precision."""
+        self.w_jacobi = self.w_jacobi.astype(np.float32)
+        if self.has_base:
+            self.w_base = self.w_base.astype(np.float32)
+        if self.has_bias:
+            self.bias = self.bias.astype(np.float32)
+        return self
+
     def forward(self, x: np.ndarray) -> np.ndarray:
         """Executes fused Metal forward pass."""
+        target_dtype = self.w_jacobi.dtype
         if not isinstance(x, np.ndarray):
-            x = np.asarray(x, dtype=np.float32)
-        elif x.dtype != np.float32:
-            x = x.astype(np.float32)
+            x = np.asarray(x, dtype=target_dtype)
+        elif x.dtype != target_dtype:
+            x = x.astype(target_dtype)
 
         orig_shape = x.shape
         if x.ndim > 2:
@@ -65,17 +88,28 @@ class JacobiKAN:
         if D_in != self.in_features:
             raise ValueError(f"Expected in_features={self.in_features}, got {D_in}")
 
-        y = np.empty((B, self.out_features), dtype=np.float32)
+        y = np.empty((B, self.out_features), dtype=target_dtype)
 
-        self._bridge.metal_kan_jacobi_forward(
-            x.ctypes.data,
-            self.w_jacobi.ctypes.data,
-            self.w_base.ctypes.data,
-            self.bias.ctypes.data,
-            y.ctypes.data,
-            B, D_in, self.out_features, self.degree, self.alpha, self.beta,
-            self.has_base, self.has_bias
-        )
+        if target_dtype == np.float16:
+            self._bridge.metal_kan_jacobi_forward_fp16(
+                x.ctypes.data,
+                self.w_jacobi.ctypes.data,
+                self.w_base.ctypes.data,
+                self.bias.ctypes.data,
+                y.ctypes.data,
+                B, D_in, self.out_features, self.degree, self.alpha, self.beta,
+                self.has_base, self.has_bias
+            )
+        else:
+            self._bridge.metal_kan_jacobi_forward(
+                x.ctypes.data,
+                self.w_jacobi.ctypes.data,
+                self.w_base.ctypes.data,
+                self.bias.ctypes.data,
+                y.ctypes.data,
+                B, D_in, self.out_features, self.degree, self.alpha, self.beta,
+                self.has_base, self.has_bias
+            )
 
         if len(orig_shape) > 2:
             return y.reshape(*orig_shape[:-1], self.out_features)

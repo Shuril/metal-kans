@@ -43,15 +43,38 @@ class ChebyKAN:
 
         self._bridge = get_metal_bridge()
 
+    @property
+    def dtype(self) -> np.dtype:
+        return self.w_cheby.dtype
+
+    def half(self) -> ChebyKAN:
+        """Converts layer parameters to FP16 half precision."""
+        self.w_cheby = self.w_cheby.astype(np.float16)
+        if self.has_base:
+            self.w_base = self.w_base.astype(np.float16)
+        if self.has_bias:
+            self.bias = self.bias.astype(np.float16)
+        return self
+
+    def float(self) -> ChebyKAN:
+        """Converts layer parameters to FP32 single precision."""
+        self.w_cheby = self.w_cheby.astype(np.float32)
+        if self.has_base:
+            self.w_base = self.w_base.astype(np.float32)
+        if self.has_bias:
+            self.bias = self.bias.astype(np.float32)
+        return self
+
     def forward(self, x: np.ndarray) -> np.ndarray:
         """
         Executes fused Metal forward pass.
-        Expects 2D NumPy float32 array of shape [B, in_features].
+        Expects 2D NumPy array of shape [B, in_features].
         """
+        target_dtype = self.w_cheby.dtype
         if not isinstance(x, np.ndarray):
-            x = np.asarray(x, dtype=np.float32)
-        elif x.dtype != np.float32:
-            x = x.astype(np.float32)
+            x = np.asarray(x, dtype=target_dtype)
+        elif x.dtype != target_dtype:
+            x = x.astype(target_dtype)
 
         orig_shape = x.shape
         if x.ndim > 2:
@@ -63,17 +86,28 @@ class ChebyKAN:
         if D_in != self.in_features:
             raise ValueError(f"Expected in_features={self.in_features}, got {D_in}")
 
-        y = np.empty((B, self.out_features), dtype=np.float32)
+        y = np.empty((B, self.out_features), dtype=target_dtype)
 
-        self._bridge.metal_kan_cheby_forward(
-            x.ctypes.data,
-            self.w_cheby.ctypes.data,
-            self.w_base.ctypes.data,
-            self.bias.ctypes.data,
-            y.ctypes.data,
-            B, D_in, self.out_features, self.degree,
-            self.has_base, self.has_bias
-        )
+        if target_dtype == np.float16:
+            self._bridge.metal_kan_cheby_forward_fp16(
+                x.ctypes.data,
+                self.w_cheby.ctypes.data,
+                self.w_base.ctypes.data,
+                self.bias.ctypes.data,
+                y.ctypes.data,
+                B, D_in, self.out_features, self.degree,
+                self.has_base, self.has_bias
+            )
+        else:
+            self._bridge.metal_kan_cheby_forward(
+                x.ctypes.data,
+                self.w_cheby.ctypes.data,
+                self.w_base.ctypes.data,
+                self.bias.ctypes.data,
+                y.ctypes.data,
+                B, D_in, self.out_features, self.degree,
+                self.has_base, self.has_bias
+            )
 
         if len(orig_shape) > 2:
             return y.reshape(*orig_shape[:-1], self.out_features)

@@ -3,7 +3,7 @@ metal-KANs: Pure Metal Shading Language (MSL) Kolmogorov-Arnold Networks for App
 High-throughput, zero-allocation GPU compute shaders with clean Python/NumPy interface.
 """
 
-from .device import is_metal_available, get_metal_bridge
+from .device import is_metal_available, get_metal_bridge, set_async, sync
 from .cheby_kan import ChebyKAN
 from .fast_kan import FastKAN
 from .relu_kan import ReLUKAN
@@ -20,9 +20,12 @@ from .pruning import compute_node_importance, prune, compact_kan
 from .symbolic import to_symbolic, SymbolicKAN, SymbolicEdge
 from .utils import count_parameters, get_model_size
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
+    # Asynchronous Execution
+    "set_async",
+    "sync",
     # 10 KAN Architectures
     "ChebyKAN",
     "FastKAN",

@@ -50,6 +50,10 @@ class RationalKAN:
 
         self._bridge = get_metal_bridge()
 
+    @property
+    def dtype(self) -> np.dtype:
+        return self.w_p.dtype
+
     def forward(self, x: np.ndarray) -> np.ndarray:
         """Executes fused Metal forward pass."""
         if not isinstance(x, np.ndarray):

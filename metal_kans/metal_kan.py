@@ -79,15 +79,50 @@ class MetalKAN:
 
             self.layers.append(layer)
 
+    @property
+    def dtype(self) -> np.dtype:
+        return getattr(self.layers[0], "dtype", np.dtype(np.float32)) if self.layers else np.dtype(np.float32)
+
+    def half(self) -> MetalKAN:
+        """Converts all network layers to FP16 half precision."""
+        for layer in self.layers:
+            if hasattr(layer, "half"):
+                layer.half()
+        return self
+
+    def float(self) -> MetalKAN:
+        """Converts all network layers to FP32 single precision."""
+        for layer in self.layers:
+            if hasattr(layer, "float"):
+                layer.float()
+        return self
+
+    def async_stream(self, batches: Sequence[np.ndarray]) -> List[np.ndarray]:
+        """
+        Executes a sequence of batches asynchronously using ring-buffered GPU pipelining.
+        Synchronizes once at the end of the batch sequence, eliminating per-iteration CPU idle latency.
+        """
+        from .device import set_async, sync
+        results = []
+        set_async(True)
+        try:
+            for b in batches:
+                results.append(self.forward(b))
+        finally:
+            sync()
+            set_async(False)
+        return results
+
     def forward(self, x: np.ndarray) -> np.ndarray:
         """Executes forward pass sequentially through all Metal layers."""
+        target_dtype = self.dtype
         if not isinstance(x, np.ndarray):
-            x = np.asarray(x, dtype=np.float32)
-        elif x.dtype != np.float32:
-            x = x.astype(np.float32)
+            x = np.asarray(x, dtype=target_dtype)
+        elif x.dtype != target_dtype:
+            x = x.astype(target_dtype)
 
         # Chained single-dispatch pipeline optimization for ChebyKAN
-        if self.pipeline and len(self.layers) > 1:
+        if self.pipeline and len(self.layers) > 1 and target_dtype == np.float32:
             return self._forward_pipelined_cheby(x)
 
         for layer in self.layers:

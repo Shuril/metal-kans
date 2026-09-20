@@ -202,9 +202,91 @@ def get_metal_bridge() -> ctypes.CDLL:
     ]
     lib.benchmark_metal_mult.restype = ctypes.c_double
 
+    # Asynchronous pipelining
+    lib.metal_kan_set_async.argtypes = [ctypes.c_int]
+    lib.metal_kan_set_async.restype = None
+
+    lib.metal_kan_sync.argtypes = []
+    lib.metal_kan_sync.restype = None
+
+    # SIMD GEMM
+    lib.metal_kan_gemm_simd_fp32.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_float, ctypes.c_float
+    ]
+    lib.metal_kan_gemm_simd_fp32.restype = ctypes.c_int
+
+    # FP16 Forwards
+    lib.metal_kan_cheby_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_cheby_forward_fp16.restype = ctypes.c_int
+
+    lib.metal_kan_fastkan_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_fastkan_forward_fp16.restype = ctypes.c_int
+
+    lib.metal_kan_relu_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_relu_forward_fp16.restype = ctypes.c_int
+
+    lib.metal_kan_wavkan_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_wavkan_forward_fp16.restype = ctypes.c_int
+
+    lib.metal_kan_fourier_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_fourier_forward_fp16.restype = ctypes.c_int
+
+    lib.metal_kan_jacobi_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_jacobi_forward_fp16.restype = ctypes.c_int
+
+    lib.metal_kan_bspline_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_bspline_forward_fp16.restype = ctypes.c_int
+
+    lib.metal_kan_lowrank_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_lowrank_forward_fp16.restype = ctypes.c_int
+
+    lib.metal_kan_mult_forward_fp16.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_mult_forward_fp16.restype = ctypes.c_int
+
     init_code = lib.metal_kan_init(_SHADER_PATH.encode("utf-8"))
     if init_code != 0:
         raise RuntimeError(f"Metal KAN shader initialization failed with code {init_code}")
 
     _lib = lib
     return _lib
+
+
+def set_async(enabled: bool = True) -> None:
+    """Enable or disable asynchronous command dispatch without per-step synchronization."""
+    bridge = get_metal_bridge()
+    bridge.metal_kan_set_async(1 if enabled else 0)
+
+
+def sync() -> None:
+    """Wait for all pending GPU commands to finish execution."""
+    bridge = get_metal_bridge()
+    bridge.metal_kan_sync()
