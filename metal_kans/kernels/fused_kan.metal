@@ -1622,3 +1622,244 @@ kernel void combine_mult_nodes_fp16(
     }
 }
 
+// ==============================================================================
+// BACKWARD GRADIENT AND BASIS DERIVATIVE COMPUTE KERNELS
+// ==============================================================================
+
+// Evaluates silu(X) into X_silu buffer: silu(x) = x / (1 + exp(-x))
+kernel void eval_silu(
+    device const float*  X       [[buffer(0)]],
+    device float*        X_silu  [[buffer(1)]],
+    constant uint&       B       [[buffer(2)]],
+    constant uint&       D_in    [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint r = gid.y;
+    uint c = gid.x;
+    if (r >= B || c >= D_in) return;
+    float x = X[r * D_in + c];
+    float inv_ln2 = 1.4426950408889634f;
+    X_silu[r * D_in + c] = x / (1.0f + exp2(-inv_ln2 * x));
+}
+
+// Column-wise reduction: dbias[c] = sum_{b=0}^{B-1} dY[b, c]
+kernel void reduce_sum_columns(
+    device const float* dY     [[buffer(0)]], // [B, D_out]
+    device float*       dbias  [[buffer(1)]], // [D_out]
+    constant uint&      B      [[buffer(2)]],
+    constant uint&      D_out  [[buffer(3)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= D_out) return;
+    float sum = 0.0f;
+    for (uint b = 0; b < B; b++) {
+        sum += dY[b * D_out + c];
+    }
+    dbias[c] = sum;
+}
+
+// Backward Chebyshev basis: dX = sum_k (dPhi_k * T'_k(x)) + (has_base ? dX_silu * silu'(x) : 0)
+kernel void backward_cheby_basis(
+    device const float*  X         [[buffer(0)]], // [B, D_in]
+    device const float*  dPhi      [[buffer(1)]], // [B, D_in * deg]
+    device const float*  dX_silu   [[buffer(2)]], // [B, D_in] (or unused if !has_base)
+    device float*        dX        [[buffer(3)]], // [B, D_in]
+    constant uint&       B         [[buffer(4)]],
+    constant uint&       D_in      [[buffer(5)]],
+    constant uint&       deg       [[buffer(6)]],
+    constant uint&       has_base  [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+
+    float raw_x = X[b * D_in + din];
+    float x = clamp(raw_x, -1.0f, 1.0f);
+    uint phi_offset = b * (D_in * deg) + din * deg;
+
+    // Evaluate Chebyshev derivatives T'_k(x)
+    // Recurrence: T'_k(x) = 2*T_{k-1}(x) + 2*x*T'_{k-1}(x) - T'_{k-2}(x)
+    float grad_basis = 0.0f;
+    if (deg > 1) {
+        // k = 0: T_0 = 1, T'_0 = 0 -> contribution = 0
+        // k = 1: T_1 = x, T'_1 = 1
+        float t_prev2 = 1.0f; // T_0
+        float t_prev1 = x;    // T_1
+        float dt_prev2 = 0.0f; // T'_0
+        float dt_prev1 = 1.0f; // T'_1
+
+        grad_basis += dPhi[phi_offset + 1] * dt_prev1;
+
+        for (uint k = 2; k < deg; k++) {
+            float t_curr = 2.0f * x * t_prev1 - t_prev2;
+            float dt_curr = 2.0f * t_prev1 + 2.0f * x * dt_prev1 - dt_prev2;
+
+            grad_basis += dPhi[phi_offset + k] * dt_curr;
+
+            t_prev2 = t_prev1;
+            t_prev1 = t_curr;
+            dt_prev2 = dt_prev1;
+            dt_prev1 = dt_curr;
+        }
+    }
+
+    // Derivative of clamp(raw_x, -1.0, 1.0) is 1.0 if inside (-1, 1), 0 otherwise
+    if (raw_x < -1.0f || raw_x > 1.0f) {
+        grad_basis = 0.0f;
+    }
+
+    float total_dx = grad_basis;
+
+    if (has_base) {
+        // silu(x) = x * sigmoid(x)
+        // d/dx silu(x) = sigmoid(x) * (1.0 + x * (1.0 - sigmoid(x)))
+        float sig = 1.0f / (1.0f + exp(-raw_x));
+        float d_silu = sig * (1.0f + raw_x * (1.0f - sig));
+        total_dx += dX_silu[b * D_in + din] * d_silu;
+    }
+
+    dX[b * D_in + din] = total_dx;
+}
+
+// Backward FastKAN RBF basis:
+// Phi_k(x) = exp(-inv_den * (x - c_k)^2)
+// dPhi_k / dx = -2 * (x - c_k) * inv_den * Phi_k(x)
+kernel void backward_fastkan_rbf_basis(
+    device const float*  X         [[buffer(0)]], // [B, D_in]
+    device const float*  grid      [[buffer(1)]], // [K]
+    device const float*  dPhi      [[buffer(2)]], // [B, D_in * K]
+    device const float*  dX_silu   [[buffer(3)]], // [B, D_in]
+    device float*        dX        [[buffer(4)]], // [B, D_in]
+    constant uint&       B         [[buffer(5)]],
+    constant uint&       D_in      [[buffer(6)]],
+    constant uint&       K         [[buffer(7)]],
+    constant float&      inv_d     [[buffer(8)]],
+    constant uint&       has_base  [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+
+    float x = X[b * D_in + din];
+    uint phi_offset = b * (D_in * K) + din * K;
+    float inv_ln2 = 1.4426950408889634f;
+
+    float grad_basis = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        float diff = x - grid[k];
+        float phi_val = exp2(-inv_ln2 * (diff * diff) * inv_d);
+        float dphi_dx = -2.0f * diff * inv_d * phi_val;
+        grad_basis += dPhi[phi_offset + k] * dphi_dx;
+    }
+
+    float total_dx = grad_basis;
+    if (has_base) {
+        float sig = 1.0f / (1.0f + exp(-x));
+        float d_silu = sig * (1.0f + x * (1.0f - sig));
+        total_dx += dX_silu[b * D_in + din] * d_silu;
+    }
+
+    dX[b * D_in + din] = total_dx;
+}
+
+// Backward ReLUKAN tent basis:
+// Phi_k(x) = max(0, 1 - |x - c_k| * inv_h)
+// dPhi_k / dx = (1 - |x - c_k| * inv_h > 0) ? (-inv_h * sgn(x - c_k)) : 0
+kernel void backward_relu_basis(
+    device const float*  X         [[buffer(0)]], // [B, D_in]
+    device const float*  grid      [[buffer(1)]], // [G]
+    device const float*  dPhi      [[buffer(2)]], // [B, D_in * G]
+    device const float*  dX_silu   [[buffer(3)]], // [B, D_in]
+    device float*        dX        [[buffer(4)]], // [B, D_in]
+    constant uint&       B         [[buffer(5)]],
+    constant uint&       D_in      [[buffer(6)]],
+    constant uint&       G         [[buffer(7)]],
+    constant float&      inv_h     [[buffer(8)]],
+    constant uint&       has_base  [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+
+    float x = X[b * D_in + din];
+    uint phi_offset = b * (D_in * G) + din * G;
+
+    float grad_basis = 0.0f;
+    for (uint g = 0; g < G; g++) {
+        float diff = x - grid[g];
+        float val = 1.0f - fabs(diff) * inv_h;
+        if (val > 0.0f) {
+            float sgn = (diff > 0.0f) ? 1.0f : ((diff < 0.0f) ? -1.0f : 0.0f);
+            float dphi_dx = -sgn * inv_h;
+            grad_basis += dPhi[phi_offset + g] * dphi_dx;
+        }
+    }
+
+    float total_dx = grad_basis;
+    if (has_base) {
+        float sig = 1.0f / (1.0f + exp(-x));
+        float d_silu = sig * (1.0f + x * (1.0f - sig));
+        total_dx += dX_silu[b * D_in + din] * d_silu;
+    }
+
+    dX[b * D_in + din] = total_dx;
+}
+
+// Backward B-Spline basis:
+// Closed-form derivative of cubic B-spline polynomials
+kernel void backward_bspline_basis(
+    device const float*  X         [[buffer(0)]], // [B, D_in]
+    device const float*  dPhi      [[buffer(1)]], // [B, D_in * num_bases]
+    device const float*  dX_silu   [[buffer(2)]], // [B, D_in]
+    device float*        dX        [[buffer(3)]], // [B, D_in]
+    constant uint&       B         [[buffer(4)]],
+    constant uint&       D_in      [[buffer(5)]],
+    constant uint&       grid_size [[buffer(6)]],
+    constant float&      grid_min  [[buffer(7)]],
+    constant float&      inv_h     [[buffer(8)]],
+    constant uint&       has_base  [[buffer(9)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint b = gid.y;
+    uint din = gid.x;
+    if (b >= B || din >= D_in) return;
+
+    float x = X[b * D_in + din];
+    uint num_bases = grid_size + 3;
+    uint phi_offset = b * (D_in * num_bases) + din * num_bases;
+
+    float pos = (x - grid_min) * inv_h;
+    int span = clamp((int)floor(pos), 0, (int)grid_size - 1);
+    float u = clamp(pos - (float)span, 0.0f, 1.0f);
+    float one_sub_u = 1.0f - u;
+
+    // Cubic B-spline derivatives with respect to u:
+    // b0(u) = (1 - u)^3 / 6 -> b0'(u) = -0.5 * (1 - u)^2
+    // b1(u) = (3u^3 - 6u^2 + 4) / 6 -> b1'(u) = (9u^2 - 12u) / 6 = 1.5 * u^2 - 2u
+    // b2(u) = (-3u^3 + 3u^2 + 3u + 1) / 6 -> b2'(u) = (-9u^2 + 6u + 3) / 6 = -1.5 * u^2 + u + 0.5
+    // b3(u) = u^3 / 6 -> b3'(u) = 0.5 * u^2
+    // d/dx = d/du * du/dx = d/du * inv_h
+    float db0 = -0.5f * one_sub_u * one_sub_u * inv_h;
+    float db1 = (1.5f * u * u - 2.0f * u) * inv_h;
+    float db2 = (-1.5f * u * u + u + 0.5f) * inv_h;
+    float db3 = 0.5f * u * u * inv_h;
+
+    float grad_basis = dPhi[phi_offset + span + 0] * db0 +
+                       dPhi[phi_offset + span + 1] * db1 +
+                       dPhi[phi_offset + span + 2] * db2 +
+                       dPhi[phi_offset + span + 3] * db3;
+
+    float total_dx = grad_basis;
+    if (has_base) {
+        float sig = 1.0f / (1.0f + exp(-x));
+        float d_silu = sig * (1.0f + x * (1.0f - sig));
+        total_dx += dX_silu[b * D_in + din] * d_silu;
+    }
+
+    dX[b * D_in + din] = total_dx;
+}
+
+

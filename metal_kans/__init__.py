@@ -19,8 +19,10 @@ from .quantization import QuantizedWeight, quantize, to_int8, to_int4
 from .pruning import compute_node_importance, prune, compact_kan
 from .symbolic import to_symbolic, SymbolicKAN, SymbolicEdge
 from .utils import count_parameters, get_model_size
+from .optim import Optimizer, Adam, SGD
+from .checkpoint import CheckpointedMetalKAN, checkpoint_kan
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     # Asynchronous Execution
@@ -38,8 +40,14 @@ __all__ = [
     "KAN",
     "MultKAN",
     "LowRankKAN",
-    # Multi-Layer Network
+    # Multi-Layer Network & Training Checkpoint
     "MetalKAN",
+    "CheckpointedMetalKAN",
+    "checkpoint_kan",
+    # Optimizers
+    "Optimizer",
+    "Adam",
+    "SGD",
     # INT8 / INT4 Quantization
     "QuantizedWeight",
     "quantize",

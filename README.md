@@ -101,13 +101,30 @@ y_half = model(x_half)  # Executed with half-precision MSL shaders
 stream_batches = [np.random.randn(256, 4).astype(np.float32) for _ in range(20)]
 stream_outputs = model.async_stream(stream_batches)  # 0 CPU-wait dispatch overhead
 
-# 4. INT8 Quantization (4x parameter compression)
+# 4. End-to-End Metal GPU Training & Optimizers (v0.5.0)
+from metal_kans import Adam, SGD, checkpoint_kan
+
+model = MetalKAN([4, 16, 2], basis_type="cheby", degree=4)
+opt = Adam(model.parameters(), lr=1e-3)
+
+# Training loop on GPU without PyTorch or MLX
+for epoch in range(100):
+    pred = model(x)
+    loss_grad = 2.0 * (pred - target) / len(x)  # MSE gradient dL/dy
+    model.backward(loss_grad)                   # Analytical basis derivatives on Metal GPU
+    opt.step()                                  # Parameter update
+    model.zero_grad()
+
+# 5. Activation Checkpointing (70-80% VRAM savings)
+ckpt_model = checkpoint_kan(model)  # Saves only inputs x, re-evaluates basis on backward
+
+# 6. INT8 Quantization (4x parameter compression)
 to_int8(model)
 
-# 5. Structural Pruning & Physical Compaction
+# 7. Structural Pruning & Physical Compaction
 compact_model = compact_kan(model, threshold=1e-3)
 
-# 6. Symbolic Formula Discovery & C Code Export
+# 8. Symbolic Formula Discovery & C Code Export
 sym = to_symbolic(compact_model, sample_points=100)
 sym.export_c("kan_model.h", func_name="kan_predict")
 ```

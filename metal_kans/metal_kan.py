@@ -164,7 +164,60 @@ class MetalKAN:
             return y.reshape(*orig_shape[:-1], out_dim)
         return y
 
-    __call__ = forward
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        return self.forward(x)
+
+    def backward(self, dY: np.ndarray) -> np.ndarray:
+        """
+        Executes backward pass in reverse layer order.
+        Returns gradient with respect to network input dX.
+        """
+        grad = dY
+        for layer in reversed(self.layers):
+            if hasattr(layer, "backward"):
+                grad = layer.backward(grad)
+            else:
+                raise NotImplementedError(f"Layer {type(layer).__name__} does not implement backward().")
+        return grad
+
+    def zero_grad(self) -> None:
+        """Zeros gradients across all layers."""
+        for layer in self.layers:
+            if hasattr(layer, "zero_grad"):
+                layer.zero_grad()
+
+    def parameters(self) -> List[tuple[np.ndarray, np.ndarray]]:
+        """
+        Returns list of (param_array, grad_array) tuples for all trainable parameters.
+        Only includes parameters that have active gradients.
+        """
+        params = []
+        for layer in self.layers:
+            # Main basis weights
+            for attr in ("w_cheby", "w_rbf", "w_relu", "w_spline", "w_wav", "w_fourier", "w_jacobi"):
+                if hasattr(layer, attr):
+                    w = getattr(layer, attr)
+                    grad_attr = f"grad_{attr}"
+                    grad = getattr(layer, grad_attr, None)
+                    if grad is not None:
+                        params.append((w, grad))
+                    break
+
+            # Residual base weights
+            if getattr(layer, "has_base", 0):
+                w_b = getattr(layer, "w_base", None)
+                grad_b = getattr(layer, "grad_w_base", None)
+                if w_b is not None and grad_b is not None:
+                    params.append((w_b, grad_b))
+
+            # Bias
+            if getattr(layer, "has_bias", 0):
+                bias = getattr(layer, "bias", None)
+                grad_bias = getattr(layer, "grad_bias", None)
+                if bias is not None and grad_bias is not None:
+                    params.append((bias, grad_bias))
+
+        return params
 
     def __repr__(self) -> str:
         layers_str = " -> ".join(map(str, self.layers_hidden))

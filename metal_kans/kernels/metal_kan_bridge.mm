@@ -28,6 +28,12 @@ static id<MTLComputePipelineState> g_pipe_relu_basis = nil;
 static id<MTLComputePipelineState> g_pipe_fourier_basis = nil;
 static id<MTLComputePipelineState> g_pipe_jacobi_basis = nil;
 static id<MTLComputePipelineState> g_pipe_combine_mult = nil;
+static id<MTLComputePipelineState> g_pipe_reduce_sum_cols = nil;
+static id<MTLComputePipelineState> g_pipe_eval_silu = nil;
+static id<MTLComputePipelineState> g_pipe_backward_cheby = nil;
+static id<MTLComputePipelineState> g_pipe_backward_rbf = nil;
+static id<MTLComputePipelineState> g_pipe_backward_relu = nil;
+static id<MTLComputePipelineState> g_pipe_backward_bspline = nil;
 
 // Direct SIMDgroup matrix & FP16 pipelines
 static id<MTLComputePipelineState> g_pipe_gemm_simd_fp32 = nil;
@@ -107,6 +113,26 @@ static id<MTLBuffer> get_scratch_internal(size_t bytes) {
     return s_int;
 }
 
+static id<MTLBuffer> get_scratch_dphi(size_t bytes) {
+    static id<MTLBuffer> s_dphi = nil;
+    static size_t s_dphi_cap = 0;
+    if (bytes > s_dphi_cap) {
+        s_dphi_cap = bytes * 2;
+        s_dphi = [g_device newBufferWithLength:s_dphi_cap options:MTLResourceStorageModePrivate];
+    }
+    return s_dphi;
+}
+
+static id<MTLBuffer> get_scratch_dx_silu(size_t bytes) {
+    static id<MTLBuffer> s_dx_silu = nil;
+    static size_t s_dx_silu_cap = 0;
+    if (bytes > s_dx_silu_cap) {
+        s_dx_silu_cap = bytes * 2;
+        s_dx_silu = [g_device newBufferWithLength:s_dx_silu_cap options:MTLResourceStorageModePrivate];
+    }
+    return s_dx_silu;
+}
+
 #include <map>
 #include <tuple>
 
@@ -139,6 +165,25 @@ static MPSMatrixMultiplication* get_cached_matmul(id<MTLDevice> dev, NSUInteger 
                                                                            alpha:alpha
                                                                             beta:beta];
     s_mm_cache[key] = mm;
+    return mm;
+}
+
+static MPSMatrixMultiplication* get_cached_matmul_general(id<MTLDevice> dev, BOOL transLeft, BOOL transRight, NSUInteger M, NSUInteger N, NSUInteger K, float alpha, float beta) {
+    static std::map<std::tuple<int, int, NSUInteger, NSUInteger, NSUInteger, int, int>, MPSMatrixMultiplication*> s_mm_gen_cache;
+    auto key = std::make_tuple((int)transLeft, (int)transRight, M, N, K, (int)(alpha * 100), (int)(beta * 100));
+    auto it = s_mm_gen_cache.find(key);
+    if (it != s_mm_gen_cache.end()) {
+        return it->second;
+    }
+    MPSMatrixMultiplication* mm = [[MPSMatrixMultiplication alloc] initWithDevice:dev
+                                                                   transposeLeft:transLeft
+                                                                  transposeRight:transRight
+                                                                      resultRows:M
+                                                                   resultColumns:N
+                                                                 interiorColumns:K
+                                                                           alpha:alpha
+                                                                            beta:beta];
+    s_mm_gen_cache[key] = mm;
     return mm;
 }
 
@@ -211,6 +256,12 @@ int metal_kan_init(const char* shader_path) {
         g_pipe_fourier_basis  = make_pipe(@"eval_fourier_basis");
         g_pipe_jacobi_basis   = make_pipe(@"eval_jacobi_basis");
         g_pipe_combine_mult   = make_pipe(@"combine_mult_nodes");
+        g_pipe_reduce_sum_cols = make_pipe(@"reduce_sum_columns");
+        g_pipe_eval_silu       = make_pipe(@"eval_silu");
+        g_pipe_backward_cheby = make_pipe(@"backward_cheby_basis");
+        g_pipe_backward_rbf   = make_pipe(@"backward_fastkan_rbf_basis");
+        g_pipe_backward_relu  = make_pipe(@"backward_relu_basis");
+        g_pipe_backward_bspline = make_pipe(@"backward_bspline_basis");
 
         // Direct SIMDgroup matrix & FP16 pipelines
         g_pipe_gemm_simd_fp32    = make_pipe(@"gemm_simd_16x16_fp32");
@@ -2550,5 +2601,552 @@ int metal_kan_jacobi_forward_fp16(
     }
 }
 
+// ==============================================================================
+// BACKWARD BRIDGE FUNCTIONS (GRADIENT & BASIS DERIVATIVES)
+// ==============================================================================
+
+int metal_kan_cheby_backward(
+    const float* dY,        // [B, D_out]
+    const float* X,         // [B, D_in]
+    const float* W_cheby,   // [D_out, D_in * degree]
+    const float* W_base,    // [D_out, D_in]
+    float*       dW_cheby,  // [D_out, D_in * degree]
+    float*       dW_base,   // [D_out, D_in]
+    float*       dbias,     // [D_out]
+    float*       dX,        // [B, D_in]
+    int B,
+    int D_in,
+    int D_out,
+    int degree,
+    int has_base,
+    int has_bias
+) {
+    @autoreleasepool {
+        int K_dim = D_in * degree;
+        id<MTLBuffer> buf_dY       = make_no_copy_buffer((void*)dY, B * D_out * sizeof(float));
+        id<MTLBuffer> buf_X        = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
+        id<MTLBuffer> buf_W_cheby  = make_no_copy_buffer((void*)W_cheby, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base   = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dW_cheby = make_no_copy_buffer((void*)dW_cheby, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_dW_base  = has_base ? make_no_copy_buffer((void*)dW_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dbias    = has_bias ? make_no_copy_buffer((void*)dbias, D_out * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dX       = make_no_copy_buffer((void*)dX, B * D_in * sizeof(float));
+
+        id<MTLBuffer> buf_Phi      = get_scratch_phi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu   = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dPhi     = get_scratch_dphi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_dX_silu  = has_base ? get_scratch_dx_silu(B * D_in * sizeof(float)) : nil;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint uDeg = (uint)degree;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+
+        // 1. Bias gradient: dbias = sum_b dY[b, :]
+        if (has_bias) {
+            id<MTLComputeCommandEncoder> enc_bias = [cmd computeCommandEncoder];
+            [enc_bias setComputePipelineState:g_pipe_reduce_sum_cols];
+            [enc_bias setBuffer:buf_dY offset:0 atIndex:0];
+            [enc_bias setBuffer:buf_dbias offset:0 atIndex:1];
+            [enc_bias setBytes:&uB length:sizeof(uint) atIndex:2];
+            [enc_bias setBytes:&uDout length:sizeof(uint) atIndex:3];
+            [enc_bias dispatchThreads:MTLSizeMake(D_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min(256, D_out), 1, 1)];
+            [enc_bias endEncoding];
+        }
+
+        // 2. Forward basis re-evaluation: Phi(X) and optional X_silu
+        id<MTLComputeCommandEncoder> enc_cheby = [cmd computeCommandEncoder];
+        [enc_cheby setComputePipelineState:g_pipe_cheby_basis];
+        [enc_cheby setBuffer:buf_X offset:0 atIndex:0];
+        [enc_cheby setBuffer:buf_Phi offset:0 atIndex:1];
+        [enc_cheby setBytes:&uB length:sizeof(uint) atIndex:2];
+        [enc_cheby setBytes:&uDin length:sizeof(uint) atIndex:3];
+        [enc_cheby setBytes:&uDeg length:sizeof(uint) atIndex:4];
+        [enc_cheby dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_cheby endEncoding];
+
+        if (has_base) {
+            id<MTLComputeCommandEncoder> enc_silu = [cmd computeCommandEncoder];
+            [enc_silu setComputePipelineState:g_pipe_eval_silu];
+            [enc_silu setBuffer:buf_X offset:0 atIndex:0];
+            [enc_silu setBuffer:buf_X_silu offset:0 atIndex:1];
+            [enc_silu setBytes:&uB length:sizeof(uint) atIndex:2];
+            [enc_silu setBytes:&uDin length:sizeof(uint) atIndex:3];
+            [enc_silu dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [enc_silu endEncoding];
+        }
+
+        // 3. Weight gradients:
+        // dW_cheby = dY^T @ Phi  [D_out x B] x [B x K_dim] -> [D_out x K_dim]
+        MPSMatrixDescriptor* desc_dY_for_dW = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrixDescriptor* desc_Phi_for_dW = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_dW = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrix* mat_dY_dW = [[[MPSMatrix alloc] initWithBuffer:buf_dY descriptor:desc_dY_for_dW] autorelease];
+        MPSMatrix* mat_Phi_dW = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_Phi_for_dW] autorelease];
+        MPSMatrix* mat_dW = [[[MPSMatrix alloc] initWithBuffer:buf_dW_cheby descriptor:desc_dW] autorelease];
+        MPSMatrixMultiplication* mm_dW = get_cached_matmul_general(g_device, YES, NO, D_out, K_dim, B, 1.0f, 0.0f);
+        [mm_dW encodeToCommandBuffer:cmd leftMatrix:mat_dY_dW rightMatrix:mat_Phi_dW resultMatrix:mat_dW];
+
+        // If has_base: dW_base = dY^T @ X_silu  [D_out x B] x [B x D_in] -> [D_out x D_in]
+        if (has_base) {
+            MPSMatrixDescriptor* desc_X_silu = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_dW_b = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrix* mat_X_silu = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_X_silu] autorelease];
+            MPSMatrix* mat_dW_b = [[[MPSMatrix alloc] initWithBuffer:buf_dW_base descriptor:desc_dW_b] autorelease];
+            MPSMatrixMultiplication* mm_dWb = get_cached_matmul_general(g_device, YES, NO, D_out, D_in, B, 1.0f, 0.0f);
+            [mm_dWb encodeToCommandBuffer:cmd leftMatrix:mat_dY_dW rightMatrix:mat_X_silu resultMatrix:mat_dW_b];
+        }
+
+        // 4. Backprop to basis activations:
+        // dPhi = dY @ W_cheby  [B x D_out] x [D_out x K_dim] -> [B x K_dim]
+        MPSMatrixDescriptor* desc_dY = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrixDescriptor* desc_W = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_dPhi = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrix* mat_dY = [[[MPSMatrix alloc] initWithBuffer:buf_dY descriptor:desc_dY] autorelease];
+        MPSMatrix* mat_W = [[[MPSMatrix alloc] initWithBuffer:buf_W_cheby descriptor:desc_W] autorelease];
+        MPSMatrix* mat_dPhi = [[[MPSMatrix alloc] initWithBuffer:buf_dPhi descriptor:desc_dPhi] autorelease];
+        MPSMatrixMultiplication* mm_dPhi = get_cached_matmul_general(g_device, NO, NO, B, K_dim, D_out, 1.0f, 0.0f);
+        [mm_dPhi encodeToCommandBuffer:cmd leftMatrix:mat_dY rightMatrix:mat_W resultMatrix:mat_dPhi];
+
+        // If has_base: dX_silu = dY @ W_base  [B x D_out] x [D_out x D_in] -> [B x D_in]
+        if (has_base) {
+            MPSMatrixDescriptor* desc_W_b = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_dX_s = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrix* mat_W_b = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_W_b] autorelease];
+            MPSMatrix* mat_dX_s = [[[MPSMatrix alloc] initWithBuffer:buf_dX_silu descriptor:desc_dX_s] autorelease];
+            MPSMatrixMultiplication* mm_dxs = get_cached_matmul_general(g_device, NO, NO, B, D_in, D_out, 1.0f, 0.0f);
+            [mm_dxs encodeToCommandBuffer:cmd leftMatrix:mat_dY rightMatrix:mat_W_b resultMatrix:mat_dX_s];
+        }
+
+        // 5. Compute dX via analytical basis derivatives:
+        id<MTLComputeCommandEncoder> enc_back = [cmd computeCommandEncoder];
+        [enc_back setComputePipelineState:g_pipe_backward_cheby];
+        [enc_back setBuffer:buf_X offset:0 atIndex:0];
+        [enc_back setBuffer:buf_dPhi offset:0 atIndex:1];
+        [enc_back setBuffer:(buf_dX_silu ? buf_dX_silu : buf_X) offset:0 atIndex:2];
+        [enc_back setBuffer:buf_dX offset:0 atIndex:3];
+        [enc_back setBytes:&uB length:sizeof(uint) atIndex:4];
+        [enc_back setBytes:&uDin length:sizeof(uint) atIndex:5];
+        [enc_back setBytes:&uDeg length:sizeof(uint) atIndex:6];
+        [enc_back setBytes:&uBase length:sizeof(uint) atIndex:7];
+        [enc_back dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_back endEncoding];
+
+        commit_and_sync(cmd);
+        return 0;
+    }
+}
+
+int metal_kan_fastkan_backward(
+    const float* dY,        // [B, D_out]
+    const float* X,         // [B, D_in]
+    const float* W_rbf,     // [D_out, D_in * num_centers]
+    const float* W_base,    // [D_out, D_in]
+    const float* grid,      // [num_centers]
+    float*       dW_rbf,    // [D_out, D_in * num_centers]
+    float*       dW_base,   // [D_out, D_in]
+    float*       dbias,     // [D_out]
+    float*       dX,        // [B, D_in]
+    int B,
+    int D_in,
+    int D_out,
+    int num_centers,
+    float inv_denominator,
+    int has_base,
+    int has_bias
+) {
+    @autoreleasepool {
+        int K_dim = D_in * num_centers;
+        id<MTLBuffer> buf_dY       = make_no_copy_buffer((void*)dY, B * D_out * sizeof(float));
+        id<MTLBuffer> buf_X        = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
+        id<MTLBuffer> buf_W_rbf    = make_no_copy_buffer((void*)W_rbf, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base   = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_grid     = make_no_copy_buffer((void*)grid, num_centers * sizeof(float));
+        id<MTLBuffer> buf_dW_rbf   = make_no_copy_buffer((void*)dW_rbf, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_dW_base  = has_base ? make_no_copy_buffer((void*)dW_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dbias    = has_bias ? make_no_copy_buffer((void*)dbias, D_out * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dX       = make_no_copy_buffer((void*)dX, B * D_in * sizeof(float));
+
+        id<MTLBuffer> buf_Phi      = get_scratch_phi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu   = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dPhi     = get_scratch_dphi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_dX_silu  = has_base ? get_scratch_dx_silu(B * D_in * sizeof(float)) : nil;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint uK = (uint)num_centers;
+        float u_inv_d = inv_denominator;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+
+        // 1. Bias gradient: dbias = sum_b dY[b, :]
+        if (has_bias) {
+            id<MTLComputeCommandEncoder> enc_bias = [cmd computeCommandEncoder];
+            [enc_bias setComputePipelineState:g_pipe_reduce_sum_cols];
+            [enc_bias setBuffer:buf_dY offset:0 atIndex:0];
+            [enc_bias setBuffer:buf_dbias offset:0 atIndex:1];
+            [enc_bias setBytes:&uB length:sizeof(uint) atIndex:2];
+            [enc_bias setBytes:&uDout length:sizeof(uint) atIndex:3];
+            [enc_bias dispatchThreads:MTLSizeMake(D_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min(256, D_out), 1, 1)];
+            [enc_bias endEncoding];
+        }
+
+        // 2. Forward basis re-evaluation: Phi(X) and optional X_silu
+        id<MTLComputeCommandEncoder> enc_rbf = [cmd computeCommandEncoder];
+        [enc_rbf setComputePipelineState:g_pipe_rbf_basis];
+        [enc_rbf setBuffer:buf_X offset:0 atIndex:0];
+        [enc_rbf setBuffer:buf_grid offset:0 atIndex:1];
+        [enc_rbf setBuffer:buf_Phi offset:0 atIndex:2];
+        [enc_rbf setBytes:&uB length:sizeof(uint) atIndex:3];
+        [enc_rbf setBytes:&uDin length:sizeof(uint) atIndex:4];
+        [enc_rbf setBytes:&uK length:sizeof(uint) atIndex:5];
+        [enc_rbf setBytes:&u_inv_d length:sizeof(float) atIndex:6];
+        [enc_rbf dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_rbf endEncoding];
+
+        if (has_base) {
+            id<MTLComputeCommandEncoder> enc_silu = [cmd computeCommandEncoder];
+            [enc_silu setComputePipelineState:g_pipe_eval_silu];
+            [enc_silu setBuffer:buf_X offset:0 atIndex:0];
+            [enc_silu setBuffer:buf_X_silu offset:0 atIndex:1];
+            [enc_silu setBytes:&uB length:sizeof(uint) atIndex:2];
+            [enc_silu setBytes:&uDin length:sizeof(uint) atIndex:3];
+            [enc_silu dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [enc_silu endEncoding];
+        }
+
+        // 3. Weight gradients:
+        // dW_rbf = dY^T @ Phi  [D_out x B] x [B x K_dim] -> [D_out x K_dim]
+        MPSMatrixDescriptor* desc_dY_for_dW = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrixDescriptor* desc_Phi_for_dW = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_dW = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrix* mat_dY_dW = [[[MPSMatrix alloc] initWithBuffer:buf_dY descriptor:desc_dY_for_dW] autorelease];
+        MPSMatrix* mat_Phi_dW = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_Phi_for_dW] autorelease];
+        MPSMatrix* mat_dW = [[[MPSMatrix alloc] initWithBuffer:buf_dW_rbf descriptor:desc_dW] autorelease];
+        MPSMatrixMultiplication* mm_dW = get_cached_matmul_general(g_device, YES, NO, D_out, K_dim, B, 1.0f, 0.0f);
+        [mm_dW encodeToCommandBuffer:cmd leftMatrix:mat_dY_dW rightMatrix:mat_Phi_dW resultMatrix:mat_dW];
+
+        if (has_base) {
+            MPSMatrixDescriptor* desc_X_silu = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_dW_b = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrix* mat_X_silu = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_X_silu] autorelease];
+            MPSMatrix* mat_dW_b = [[[MPSMatrix alloc] initWithBuffer:buf_dW_base descriptor:desc_dW_b] autorelease];
+            MPSMatrixMultiplication* mm_dWb = get_cached_matmul_general(g_device, YES, NO, D_out, D_in, B, 1.0f, 0.0f);
+            [mm_dWb encodeToCommandBuffer:cmd leftMatrix:mat_dY_dW rightMatrix:mat_X_silu resultMatrix:mat_dW_b];
+        }
+
+        // 4. Backprop to basis activations:
+        // dPhi = dY @ W_rbf  [B x D_out] x [D_out x K_dim] -> [B x K_dim]
+        MPSMatrixDescriptor* desc_dY = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrixDescriptor* desc_W = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_dPhi = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrix* mat_dY = [[[MPSMatrix alloc] initWithBuffer:buf_dY descriptor:desc_dY] autorelease];
+        MPSMatrix* mat_W = [[[MPSMatrix alloc] initWithBuffer:buf_W_rbf descriptor:desc_W] autorelease];
+        MPSMatrix* mat_dPhi = [[[MPSMatrix alloc] initWithBuffer:buf_dPhi descriptor:desc_dPhi] autorelease];
+        MPSMatrixMultiplication* mm_dPhi = get_cached_matmul_general(g_device, NO, NO, B, K_dim, D_out, 1.0f, 0.0f);
+        [mm_dPhi encodeToCommandBuffer:cmd leftMatrix:mat_dY rightMatrix:mat_W resultMatrix:mat_dPhi];
+
+        if (has_base) {
+            MPSMatrixDescriptor* desc_W_b = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_dX_s = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrix* mat_W_b = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_W_b] autorelease];
+            MPSMatrix* mat_dX_s = [[[MPSMatrix alloc] initWithBuffer:buf_dX_silu descriptor:desc_dX_s] autorelease];
+            MPSMatrixMultiplication* mm_dxs = get_cached_matmul_general(g_device, NO, NO, B, D_in, D_out, 1.0f, 0.0f);
+            [mm_dxs encodeToCommandBuffer:cmd leftMatrix:mat_dY rightMatrix:mat_W_b resultMatrix:mat_dX_s];
+        }
+
+        // 5. Compute dX via analytical FastKAN RBF basis derivatives:
+        id<MTLComputeCommandEncoder> enc_back = [cmd computeCommandEncoder];
+        [enc_back setComputePipelineState:g_pipe_backward_rbf];
+        [enc_back setBuffer:buf_X offset:0 atIndex:0];
+        [enc_back setBuffer:buf_grid offset:0 atIndex:1];
+        [enc_back setBuffer:buf_dPhi offset:0 atIndex:2];
+        [enc_back setBuffer:(buf_dX_silu ? buf_dX_silu : buf_X) offset:0 atIndex:3];
+        [enc_back setBuffer:buf_dX offset:0 atIndex:4];
+        [enc_back setBytes:&uB length:sizeof(uint) atIndex:5];
+        [enc_back setBytes:&uDin length:sizeof(uint) atIndex:6];
+        [enc_back setBytes:&uK length:sizeof(uint) atIndex:7];
+        [enc_back setBytes:&u_inv_d length:sizeof(float) atIndex:8];
+        [enc_back setBytes:&uBase length:sizeof(uint) atIndex:9];
+        [enc_back dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_back endEncoding];
+
+        commit_and_sync(cmd);
+        return 0;
+    }
+}
+
+int metal_kan_relu_backward(
+    const float* dY,        // [B, D_out]
+    const float* X,         // [B, D_in]
+    const float* W_relu,    // [D_out, D_in * num_grids]
+    const float* W_base,    // [D_out, D_in]
+    const float* grid,      // [num_grids]
+    float*       dW_relu,   // [D_out, D_in * num_grids]
+    float*       dW_base,   // [D_out, D_in]
+    float*       dbias,     // [D_out]
+    float*       dX,        // [B, D_in]
+    int B,
+    int D_in,
+    int D_out,
+    int num_grids,
+    float inv_h,
+    int has_base,
+    int has_bias
+) {
+    @autoreleasepool {
+        int G_dim = D_in * num_grids;
+        id<MTLBuffer> buf_dY       = make_no_copy_buffer((void*)dY, B * D_out * sizeof(float));
+        id<MTLBuffer> buf_X        = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
+        id<MTLBuffer> buf_W_relu   = make_no_copy_buffer((void*)W_relu, D_out * G_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base   = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_grid     = make_no_copy_buffer((void*)grid, num_grids * sizeof(float));
+        id<MTLBuffer> buf_dW_relu  = make_no_copy_buffer((void*)dW_relu, D_out * G_dim * sizeof(float));
+        id<MTLBuffer> buf_dW_base  = has_base ? make_no_copy_buffer((void*)dW_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dbias    = has_bias ? make_no_copy_buffer((void*)dbias, D_out * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dX       = make_no_copy_buffer((void*)dX, B * D_in * sizeof(float));
+
+        id<MTLBuffer> buf_Phi      = get_scratch_phi(B * G_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu   = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dPhi     = get_scratch_dphi(B * G_dim * sizeof(float));
+        id<MTLBuffer> buf_dX_silu  = has_base ? get_scratch_dx_silu(B * D_in * sizeof(float)) : nil;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint uG = (uint)num_grids;
+        float u_inv_h = inv_h;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+
+        // 1. Bias gradient
+        if (has_bias) {
+            id<MTLComputeCommandEncoder> enc_bias = [cmd computeCommandEncoder];
+            [enc_bias setComputePipelineState:g_pipe_reduce_sum_cols];
+            [enc_bias setBuffer:buf_dY offset:0 atIndex:0];
+            [enc_bias setBuffer:buf_dbias offset:0 atIndex:1];
+            [enc_bias setBytes:&uB length:sizeof(uint) atIndex:2];
+            [enc_bias setBytes:&uDout length:sizeof(uint) atIndex:3];
+            [enc_bias dispatchThreads:MTLSizeMake(D_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min(256, D_out), 1, 1)];
+            [enc_bias endEncoding];
+        }
+
+        // 2. Basis evaluation
+        id<MTLComputeCommandEncoder> enc_relu = [cmd computeCommandEncoder];
+        [enc_relu setComputePipelineState:g_pipe_relu_basis];
+        [enc_relu setBuffer:buf_X offset:0 atIndex:0];
+        [enc_relu setBuffer:buf_grid offset:0 atIndex:1];
+        [enc_relu setBuffer:buf_Phi offset:0 atIndex:2];
+        [enc_relu setBytes:&uB length:sizeof(uint) atIndex:3];
+        [enc_relu setBytes:&uDin length:sizeof(uint) atIndex:4];
+        [enc_relu setBytes:&uG length:sizeof(uint) atIndex:5];
+        [enc_relu setBytes:&u_inv_h length:sizeof(float) atIndex:6];
+        [enc_relu dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_relu endEncoding];
+
+        if (has_base) {
+            id<MTLComputeCommandEncoder> enc_silu = [cmd computeCommandEncoder];
+            [enc_silu setComputePipelineState:g_pipe_eval_silu];
+            [enc_silu setBuffer:buf_X offset:0 atIndex:0];
+            [enc_silu setBuffer:buf_X_silu offset:0 atIndex:1];
+            [enc_silu setBytes:&uB length:sizeof(uint) atIndex:2];
+            [enc_silu setBytes:&uDin length:sizeof(uint) atIndex:3];
+            [enc_silu dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [enc_silu endEncoding];
+        }
+
+        // 3. Weight gradients: dW_relu = dY^T @ Phi
+        MPSMatrixDescriptor* desc_dY_for_dW = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrixDescriptor* desc_Phi_for_dW = get_cached_desc(B, G_dim, G_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_dW = get_cached_desc(D_out, G_dim, G_dim * sizeof(float));
+        MPSMatrix* mat_dY_dW = [[[MPSMatrix alloc] initWithBuffer:buf_dY descriptor:desc_dY_for_dW] autorelease];
+        MPSMatrix* mat_Phi_dW = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_Phi_for_dW] autorelease];
+        MPSMatrix* mat_dW = [[[MPSMatrix alloc] initWithBuffer:buf_dW_relu descriptor:desc_dW] autorelease];
+        MPSMatrixMultiplication* mm_dW = get_cached_matmul_general(g_device, YES, NO, D_out, G_dim, B, 1.0f, 0.0f);
+        [mm_dW encodeToCommandBuffer:cmd leftMatrix:mat_dY_dW rightMatrix:mat_Phi_dW resultMatrix:mat_dW];
+
+        if (has_base) {
+            MPSMatrixDescriptor* desc_X_silu = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_dW_b = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrix* mat_X_silu = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_X_silu] autorelease];
+            MPSMatrix* mat_dW_b = [[[MPSMatrix alloc] initWithBuffer:buf_dW_base descriptor:desc_dW_b] autorelease];
+            MPSMatrixMultiplication* mm_dWb = get_cached_matmul_general(g_device, YES, NO, D_out, D_in, B, 1.0f, 0.0f);
+            [mm_dWb encodeToCommandBuffer:cmd leftMatrix:mat_dY_dW rightMatrix:mat_X_silu resultMatrix:mat_dW_b];
+        }
+
+        // 4. Backprop to basis: dPhi = dY @ W_relu
+        MPSMatrixDescriptor* desc_dY = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrixDescriptor* desc_W = get_cached_desc(D_out, G_dim, G_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_dPhi = get_cached_desc(B, G_dim, G_dim * sizeof(float));
+        MPSMatrix* mat_dY = [[[MPSMatrix alloc] initWithBuffer:buf_dY descriptor:desc_dY] autorelease];
+        MPSMatrix* mat_W = [[[MPSMatrix alloc] initWithBuffer:buf_W_relu descriptor:desc_W] autorelease];
+        MPSMatrix* mat_dPhi = [[[MPSMatrix alloc] initWithBuffer:buf_dPhi descriptor:desc_dPhi] autorelease];
+        MPSMatrixMultiplication* mm_dPhi = get_cached_matmul_general(g_device, NO, NO, B, G_dim, D_out, 1.0f, 0.0f);
+        [mm_dPhi encodeToCommandBuffer:cmd leftMatrix:mat_dY rightMatrix:mat_W resultMatrix:mat_dPhi];
+
+        if (has_base) {
+            MPSMatrixDescriptor* desc_W_b = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_dX_s = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrix* mat_W_b = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_W_b] autorelease];
+            MPSMatrix* mat_dX_s = [[[MPSMatrix alloc] initWithBuffer:buf_dX_silu descriptor:desc_dX_s] autorelease];
+            MPSMatrixMultiplication* mm_dxs = get_cached_matmul_general(g_device, NO, NO, B, D_in, D_out, 1.0f, 0.0f);
+            [mm_dxs encodeToCommandBuffer:cmd leftMatrix:mat_dY rightMatrix:mat_W_b resultMatrix:mat_dX_s];
+        }
+
+        // 5. Compute dX
+        id<MTLComputeCommandEncoder> enc_back = [cmd computeCommandEncoder];
+        [enc_back setComputePipelineState:g_pipe_backward_relu];
+        [enc_back setBuffer:buf_X offset:0 atIndex:0];
+        [enc_back setBuffer:buf_grid offset:0 atIndex:1];
+        [enc_back setBuffer:buf_dPhi offset:0 atIndex:2];
+        [enc_back setBuffer:(buf_dX_silu ? buf_dX_silu : buf_X) offset:0 atIndex:3];
+        [enc_back setBuffer:buf_dX offset:0 atIndex:4];
+        [enc_back setBytes:&uB length:sizeof(uint) atIndex:5];
+        [enc_back setBytes:&uDin length:sizeof(uint) atIndex:6];
+        [enc_back setBytes:&uG length:sizeof(uint) atIndex:7];
+        [enc_back setBytes:&u_inv_h length:sizeof(float) atIndex:8];
+        [enc_back setBytes:&uBase length:sizeof(uint) atIndex:9];
+        [enc_back dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_back endEncoding];
+
+        commit_and_sync(cmd);
+        return 0;
+    }
+}
+
+int metal_kan_bspline_backward(
+    const float* dY,        // [B, D_out]
+    const float* X,         // [B, D_in]
+    const float* W_spline,  // [D_out, D_in * num_bases]
+    const float* W_base,    // [D_out, D_in]
+    float*       dW_spline, // [D_out, D_in * num_bases]
+    float*       dW_base,   // [D_out, D_in]
+    float*       dbias,     // [D_out]
+    float*       dX,        // [B, D_in]
+    int B,
+    int D_in,
+    int D_out,
+    int grid_size,
+    float grid_min,
+    float inv_h,
+    int has_base,
+    int has_bias
+) {
+    @autoreleasepool {
+        int num_bases = grid_size + 3;
+        int K_dim = D_in * num_bases;
+        id<MTLBuffer> buf_dY       = make_no_copy_buffer((void*)dY, B * D_out * sizeof(float));
+        id<MTLBuffer> buf_X        = make_no_copy_buffer((void*)X, B * D_in * sizeof(float));
+        id<MTLBuffer> buf_W_spline = make_no_copy_buffer((void*)W_spline, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_W_base   = has_base ? make_no_copy_buffer((void*)W_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dW_spline= make_no_copy_buffer((void*)dW_spline, D_out * K_dim * sizeof(float));
+        id<MTLBuffer> buf_dW_base  = has_base ? make_no_copy_buffer((void*)dW_base, D_out * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dbias    = has_bias ? make_no_copy_buffer((void*)dbias, D_out * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dX       = make_no_copy_buffer((void*)dX, B * D_in * sizeof(float));
+
+        id<MTLBuffer> buf_Phi      = get_scratch_phi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_X_silu   = has_base ? get_scratch_silu(B * D_in * sizeof(float)) : nil;
+        id<MTLBuffer> buf_dPhi     = get_scratch_dphi(B * K_dim * sizeof(float));
+        id<MTLBuffer> buf_dX_silu  = has_base ? get_scratch_dx_silu(B * D_in * sizeof(float)) : nil;
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        uint uB = (uint)B, uDin = (uint)D_in, uDout = (uint)D_out;
+        uint u_grid_size = (uint)grid_size;
+        float u_grid_min = grid_min, u_inv_h = inv_h;
+        uint uBase = (uint)has_base, uBias = (uint)has_bias;
+
+        // 1. Bias gradient
+        if (has_bias) {
+            id<MTLComputeCommandEncoder> enc_bias = [cmd computeCommandEncoder];
+            [enc_bias setComputePipelineState:g_pipe_reduce_sum_cols];
+            [enc_bias setBuffer:buf_dY offset:0 atIndex:0];
+            [enc_bias setBuffer:buf_dbias offset:0 atIndex:1];
+            [enc_bias setBytes:&uB length:sizeof(uint) atIndex:2];
+            [enc_bias setBytes:&uDout length:sizeof(uint) atIndex:3];
+            [enc_bias dispatchThreads:MTLSizeMake(D_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min(256, D_out), 1, 1)];
+            [enc_bias endEncoding];
+        }
+
+        // 2. Basis evaluation
+        id<MTLComputeCommandEncoder> enc_bspline = [cmd computeCommandEncoder];
+        [enc_bspline setComputePipelineState:g_pipe_bspline_basis];
+        [enc_bspline setBuffer:buf_X offset:0 atIndex:0];
+        [enc_bspline setBuffer:buf_Phi offset:0 atIndex:1];
+        [enc_bspline setBytes:&uB length:sizeof(uint) atIndex:2];
+        [enc_bspline setBytes:&uDin length:sizeof(uint) atIndex:3];
+        [enc_bspline setBytes:&u_grid_size length:sizeof(uint) atIndex:4];
+        [enc_bspline setBytes:&u_grid_min length:sizeof(float) atIndex:5];
+        [enc_bspline setBytes:&u_inv_h length:sizeof(float) atIndex:6];
+        [enc_bspline dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_bspline endEncoding];
+
+        if (has_base) {
+            id<MTLComputeCommandEncoder> enc_silu = [cmd computeCommandEncoder];
+            [enc_silu setComputePipelineState:g_pipe_eval_silu];
+            [enc_silu setBuffer:buf_X offset:0 atIndex:0];
+            [enc_silu setBuffer:buf_X_silu offset:0 atIndex:1];
+            [enc_silu setBytes:&uB length:sizeof(uint) atIndex:2];
+            [enc_silu setBytes:&uDin length:sizeof(uint) atIndex:3];
+            [enc_silu dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [enc_silu endEncoding];
+        }
+
+        // 3. Weight gradients: dW_spline = dY^T @ Phi
+        MPSMatrixDescriptor* desc_dY_for_dW = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrixDescriptor* desc_Phi_for_dW = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_dW = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrix* mat_dY_dW = [[[MPSMatrix alloc] initWithBuffer:buf_dY descriptor:desc_dY_for_dW] autorelease];
+        MPSMatrix* mat_Phi_dW = [[[MPSMatrix alloc] initWithBuffer:buf_Phi descriptor:desc_Phi_for_dW] autorelease];
+        MPSMatrix* mat_dW = [[[MPSMatrix alloc] initWithBuffer:buf_dW_spline descriptor:desc_dW] autorelease];
+        MPSMatrixMultiplication* mm_dW = get_cached_matmul_general(g_device, YES, NO, D_out, K_dim, B, 1.0f, 0.0f);
+        [mm_dW encodeToCommandBuffer:cmd leftMatrix:mat_dY_dW rightMatrix:mat_Phi_dW resultMatrix:mat_dW];
+
+        if (has_base) {
+            MPSMatrixDescriptor* desc_X_silu = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_dW_b = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrix* mat_X_silu = [[[MPSMatrix alloc] initWithBuffer:buf_X_silu descriptor:desc_X_silu] autorelease];
+            MPSMatrix* mat_dW_b = [[[MPSMatrix alloc] initWithBuffer:buf_dW_base descriptor:desc_dW_b] autorelease];
+            MPSMatrixMultiplication* mm_dWb = get_cached_matmul_general(g_device, YES, NO, D_out, D_in, B, 1.0f, 0.0f);
+            [mm_dWb encodeToCommandBuffer:cmd leftMatrix:mat_dY_dW rightMatrix:mat_X_silu resultMatrix:mat_dW_b];
+        }
+
+        // 4. Backprop to basis: dPhi = dY @ W_spline
+        MPSMatrixDescriptor* desc_dY = get_cached_desc(B, D_out, D_out * sizeof(float));
+        MPSMatrixDescriptor* desc_W = get_cached_desc(D_out, K_dim, K_dim * sizeof(float));
+        MPSMatrixDescriptor* desc_dPhi = get_cached_desc(B, K_dim, K_dim * sizeof(float));
+        MPSMatrix* mat_dY = [[[MPSMatrix alloc] initWithBuffer:buf_dY descriptor:desc_dY] autorelease];
+        MPSMatrix* mat_W = [[[MPSMatrix alloc] initWithBuffer:buf_W_spline descriptor:desc_W] autorelease];
+        MPSMatrix* mat_dPhi = [[[MPSMatrix alloc] initWithBuffer:buf_dPhi descriptor:desc_dPhi] autorelease];
+        MPSMatrixMultiplication* mm_dPhi = get_cached_matmul_general(g_device, NO, NO, B, K_dim, D_out, 1.0f, 0.0f);
+        [mm_dPhi encodeToCommandBuffer:cmd leftMatrix:mat_dY rightMatrix:mat_W resultMatrix:mat_dPhi];
+
+        if (has_base) {
+            MPSMatrixDescriptor* desc_W_b = get_cached_desc(D_out, D_in, D_in * sizeof(float));
+            MPSMatrixDescriptor* desc_dX_s = get_cached_desc(B, D_in, D_in * sizeof(float));
+            MPSMatrix* mat_W_b = [[[MPSMatrix alloc] initWithBuffer:buf_W_base descriptor:desc_W_b] autorelease];
+            MPSMatrix* mat_dX_s = [[[MPSMatrix alloc] initWithBuffer:buf_dX_silu descriptor:desc_dX_s] autorelease];
+            MPSMatrixMultiplication* mm_dxs = get_cached_matmul_general(g_device, NO, NO, B, D_in, D_out, 1.0f, 0.0f);
+            [mm_dxs encodeToCommandBuffer:cmd leftMatrix:mat_dY rightMatrix:mat_W_b resultMatrix:mat_dX_s];
+        }
+
+        // 5. Compute dX
+        id<MTLComputeCommandEncoder> enc_back = [cmd computeCommandEncoder];
+        [enc_back setComputePipelineState:g_pipe_backward_bspline];
+        [enc_back setBuffer:buf_X offset:0 atIndex:0];
+        [enc_back setBuffer:buf_dPhi offset:0 atIndex:1];
+        [enc_back setBuffer:(buf_dX_silu ? buf_dX_silu : buf_X) offset:0 atIndex:2];
+        [enc_back setBuffer:buf_dX offset:0 atIndex:3];
+        [enc_back setBytes:&uB length:sizeof(uint) atIndex:4];
+        [enc_back setBytes:&uDin length:sizeof(uint) atIndex:5];
+        [enc_back setBytes:&u_grid_size length:sizeof(uint) atIndex:6];
+        [enc_back setBytes:&u_grid_min length:sizeof(float) atIndex:7];
+        [enc_back setBytes:&u_inv_h length:sizeof(float) atIndex:8];
+        [enc_back setBytes:&uBase length:sizeof(uint) atIndex:9];
+        [enc_back dispatchThreads:MTLSizeMake(D_in, B, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc_back endEncoding];
+
+        commit_and_sync(cmd);
+        return 0;
+    }
+}
+
 } // extern "C"
+
 

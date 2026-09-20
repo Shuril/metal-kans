@@ -97,13 +97,30 @@ y_half = model(x_half)  # Вычисляется на half-шейдерах MSL
 stream_batches = [np.random.randn(256, 4).astype(np.float32) for _ in range(20)]
 stream_outputs = model.async_stream(stream_batches)  # Без блокировок CPU между батчами
 
-# 4. Квантование весов в INT8 (4-кратное сжатие памяти)
+# 4. Полноценное обучение на Metal GPU и оптимизаторы (v0.5.0)
+from metal_kans import Adam, SGD, checkpoint_kan
+
+model = MetalKAN([4, 16, 2], basis_type="cheby", degree=4)
+opt = Adam(model.parameters(), lr=1e-3)
+
+# Цикл обучения напрямую на Metal GPU без PyTorch и MLX
+for epoch in range(100):
+    pred = model(x)
+    loss_grad = 2.0 * (pred - target) / len(x)  # Градиент MSE dL/dy
+    model.backward(loss_grad)                   # Аналитические производные базиса на Metal GPU
+    opt.step()                                  # Шаг оптимизатора
+    model.zero_grad()
+
+# 5. Activation Checkpointing (экономия 70-80% VRAM)
+ckpt_model = checkpoint_kan(model)  # Сохраняет только входы x, пересчитывая базис на backward
+
+# 6. Квантование весов в INT8 (4-кратное сжатие памяти)
 to_int8(model)
 
-# 5. Структурный прунинг и физическая компактизация сети
+# 7. Структурный прунинг и физическая компактизация сети
 compact_model = compact_kan(model, threshold=1e-3)
 
-# 6. Символьная регрессия и экспорт в C99
+# 8. Символьная регрессия и экспорт в C99
 sym = to_symbolic(compact_model, sample_points=100)
 sym.export_c("kan_model.h", func_name="kan_predict")
 ```

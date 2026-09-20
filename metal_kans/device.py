@@ -272,6 +272,35 @@ def get_metal_bridge() -> ctypes.CDLL:
     ]
     lib.metal_kan_mult_forward_fp16.restype = ctypes.c_int
 
+    # Backward gradient and basis derivative signatures
+    lib.metal_kan_cheby_backward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_cheby_backward.restype = ctypes.c_int
+
+    lib.metal_kan_fastkan_backward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_fastkan_backward.restype = ctypes.c_int
+
+    lib.metal_kan_relu_backward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_relu_backward.restype = ctypes.c_int
+
+    lib.metal_kan_bspline_backward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int
+    ]
+    lib.metal_kan_bspline_backward.restype = ctypes.c_int
+
     init_code = lib.metal_kan_init(_SHADER_PATH.encode("utf-8"))
     if init_code != 0:
         raise RuntimeError(f"Metal KAN shader initialization failed with code {init_code}")

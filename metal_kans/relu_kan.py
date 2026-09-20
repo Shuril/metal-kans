@@ -46,6 +46,11 @@ class ReLUKAN:
         self.w_base = np.random.uniform(-bound, bound, (out_features, in_features)).astype(np.float32) if use_base else np.zeros((1,), dtype=np.float32)
         self.bias = np.zeros((out_features,), dtype=np.float32) if bias else np.zeros((1,), dtype=np.float32)
 
+        self.grad_w_relu = np.zeros_like(self.w_relu)
+        self.grad_w_base = np.zeros_like(self.w_base) if use_base else None
+        self.grad_bias = np.zeros_like(self.bias) if bias else None
+        self._saved_x: Optional[np.ndarray] = None
+
         self._bridge = get_metal_bridge()
 
     @property
@@ -86,6 +91,9 @@ class ReLUKAN:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
 
+        self._saved_x = x
+        self._saved_shape = orig_shape
+
         B, D_in = x.shape
         if D_in != self.in_features:
             raise ValueError(f"Expected in_features={self.in_features}, got {D_in}")
@@ -120,6 +128,78 @@ class ReLUKAN:
         return y
 
     __call__ = forward
+
+    def backward(self, dY: np.ndarray) -> np.ndarray:
+        """Executes GPU backward pass: computes weight gradients and returns dX."""
+        if self._saved_x is None:
+            raise RuntimeError("Cannot run backward before forward() has been called.")
+
+        x = self._saved_x
+        B, D_in = x.shape
+
+        if not isinstance(dY, np.ndarray):
+            dY = np.asarray(dY, dtype=np.float32)
+        elif dY.dtype != np.float32:
+            dY = dY.astype(np.float32)
+
+        if dY.ndim > 2:
+            dY = dY.reshape(B, self.out_features)
+        if not dY.flags['C_CONTIGUOUS']:
+            dY = np.ascontiguousarray(dY)
+
+        if self.grad_w_relu is None:
+            self.grad_w_relu = np.zeros_like(self.w_relu, dtype=np.float32)
+        else:
+            self.grad_w_relu.fill(0)
+
+        if self.has_base:
+            if self.grad_w_base is None:
+                self.grad_w_base = np.zeros_like(self.w_base, dtype=np.float32)
+            else:
+                self.grad_w_base.fill(0)
+        else:
+            self.grad_w_base = np.zeros((1,), dtype=np.float32)
+
+        if self.has_bias:
+            if self.grad_bias is None:
+                self.grad_bias = np.zeros_like(self.bias, dtype=np.float32)
+            else:
+                self.grad_bias.fill(0)
+        else:
+            self.grad_bias = np.zeros((1,), dtype=np.float32)
+
+        dX = np.empty((B, D_in), dtype=np.float32)
+
+        grad_base_ptr = self.grad_w_base.ctypes.data if self.has_base else None
+        grad_bias_ptr = self.grad_bias.ctypes.data if self.has_bias else None
+        w_base_ptr = self.w_base.ctypes.data if self.has_base else None
+
+        self._bridge.metal_kan_relu_backward(
+            dY.ctypes.data,
+            x.ctypes.data,
+            self.w_relu.ctypes.data,
+            w_base_ptr,
+            self.grid.ctypes.data,
+            self.grad_w_relu.ctypes.data,
+            grad_base_ptr,
+            grad_bias_ptr,
+            dX.ctypes.data,
+            B, D_in, self.out_features, self.num_grids, self.inv_h,
+            self.has_base, self.has_bias
+        )
+
+        if hasattr(self, '_saved_shape') and len(self._saved_shape) > 2:
+            return dX.reshape(self._saved_shape)
+        return dX
+
+    def zero_grad(self) -> None:
+        """Zeros stored parameter gradients."""
+        if self.grad_w_relu is not None:
+            self.grad_w_relu.fill(0)
+        if self.grad_w_base is not None:
+            self.grad_w_base.fill(0)
+        if self.grad_bias is not None:
+            self.grad_bias.fill(0)
 
     def benchmark(self, x: np.ndarray, warmup: int = 10, iters: int = 50) -> float:
         """Benchmarks kernel execution time in milliseconds directly on GPU."""
