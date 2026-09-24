@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metal-kans"
+version = "0.5.0"
+description = "metal-KANs: Pure Metal Shading Language (MSL) Kolmogorov-Arnold Networks for Apple Silicon GPU"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Alex", email = "cara26@bk.ru" }
+]
+keywords = [
+    "metal-kans",
+    "metal",
+    "msl",
+    "apple-silicon",
+    "kan",
+    "kolmogorov-arnold-networks",
+    "chebykan",
+    "fastkan",
+    "relukan",
+    "gpu-acceleration",
+    "zero-allocation"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+    "numpy>=1.22.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["metal_kans*"]
+
+[tool.setuptools.package-data]
+metal_kans = ["kernels/*.metal", "kernels/*.mm"]
